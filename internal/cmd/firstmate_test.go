@@ -119,6 +119,32 @@ func TestExecuteFirstmateSendPreservesStderrAndExit255(t *testing.T) {
 	}
 }
 
+func TestFirstmateCommandDoesNotAppendCobraTextToFmSendError(t *testing.T) {
+	root := makeFakeFirstmateRoot(t)
+	data := []byte(`[{"id":"gt-abc","title":"Bridge","description":"Delegate it"}]`)
+	deps := firstmateDelegateDeps{
+		showBead:      func(context.Context, string) ([]byte, error) { return data, nil },
+		verifyTracked: func(context.Context, string, string) error { return nil },
+		runSend: func(_ context.Context, _, _, _, _, _ string, _ io.Writer, stderr io.Writer) error {
+			fmt.Fprint(stderr, "exact recovery stderr\n")
+			return NewSilentExit(255)
+		},
+		lookupEnv: func(string) (string, bool) { return "", false },
+	}
+	cmd := newFirstmateCommand(deps)
+	var stdout, stderr bytes.Buffer
+	cmd.SetOut(&stdout)
+	cmd.SetErr(&stderr)
+	cmd.SetArgs([]string{"delegate", "gt-abc", "alienware-ml", "--firstmate-root", root})
+	err := cmd.Execute()
+	if code, ok := IsSilentExit(err); !ok || code != 255 {
+		t.Fatalf("error = %T %v, want silent exit 255", err, err)
+	}
+	if got, want := stderr.String(), "exact recovery stderr\n"; got != want {
+		t.Fatalf("stderr = %q, want exact %q", got, want)
+	}
+}
+
 func TestResolveFirstmatePathsUsesSafeEnvironmentPrecedence(t *testing.T) {
 	root := makeFakeFirstmateRoot(t)
 	home := t.TempDir()
