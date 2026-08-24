@@ -287,14 +287,39 @@ func TestRunDoneRejectsMayorRigBeforeAutosave(t *testing.T) {
 }
 
 func TestIsDoneCommand(t *testing.T) {
-	done := &cobra.Command{Use: "done"}
-	root := &cobra.Command{Use: "gt"}
-	root.AddCommand(done)
-	if !isDoneCommand(done) {
-		t.Fatal("done command should be detected")
+	if !isDoneCommand(doneCmd) {
+		t.Fatal("top-level done command should be detected")
 	}
-	if isDoneCommand(root) {
+	if isDoneCommand(rootCmd) {
 		t.Fatal("root command should not be detected as done")
+	}
+
+	for _, cmd := range []*cobra.Command{dogDoneCmd, moleculeStepDoneCmd, wlDoneCmd} {
+		if isDoneCommand(cmd) {
+			t.Errorf("nested command %q should not use polecat done semantics", cmd.CommandPath())
+		}
+	}
+}
+
+func TestIsDoneInvocationDistinguishesNestedDoneCommands(t *testing.T) {
+	tests := []struct {
+		name string
+		args []string
+		want bool
+	}{
+		{name: "polecat completion", args: []string{"done"}, want: true},
+		{name: "dog completion auto-detect", args: []string{"dog", "done"}, want: false},
+		{name: "dog completion explicit name", args: []string{"dog", "done", "bravo"}, want: false},
+		{name: "molecule step completion", args: []string{"mol", "step", "done", "gt-step"}, want: false},
+		{name: "wasteland completion", args: []string{"wl", "done", "wanted-id"}, want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isDoneInvocation(tt.args); got != tt.want {
+				t.Errorf("isDoneInvocation(%q) = %v, want %v", tt.args, got, tt.want)
+			}
+		})
 	}
 }
 
@@ -315,8 +340,7 @@ func TestPersistentPreRunDoneRejectsBeforeRegistryFallback(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = os.Chdir(origDir) })
 
-	done := &cobra.Command{Use: "done"}
-	err = persistentPreRun(done, nil)
+	err = persistentPreRun(doneCmd, nil)
 	if err == nil || !strings.Contains(err.Error(), "assigned polecat worktree") {
 		t.Fatalf("persistentPreRun error = %v, want assigned worktree rejection", err)
 	}
