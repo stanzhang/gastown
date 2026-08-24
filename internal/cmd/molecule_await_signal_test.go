@@ -310,12 +310,15 @@ func TestBackoffWindowResumption(t *testing.T) {
 	}
 }
 
-func TestRunMoleculeAwaitSignalAgentBeadUsesCwdRigBeadsDirWhenBeadsDirPointsTown(t *testing.T) {
+func TestRunMoleculeAwaitSignalAgentBeadUsesTownBeadsDirFromRigCwd(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("uses a POSIX shell fake bd")
 	}
 
-	tmp := t.TempDir()
+	tmp, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatalf("resolve temp dir: %v", err)
+	}
 	townRoot := filepath.Join(tmp, "gt")
 	townBeads := filepath.Join(townRoot, ".beads")
 	rigWorkDir := filepath.Join(townRoot, "gastown", "refinery", "rig")
@@ -341,6 +344,10 @@ func TestRunMoleculeAwaitSignalAgentBeadUsesCwdRigBeadsDirWhenBeadsDirPointsTown
 	metadata := []byte(`{"dolt_database":"rigdb","dolt_server_host":"127.0.0.1","dolt_server_port":3307}`)
 	if err := os.WriteFile(filepath.Join(rigBeads, "metadata.json"), metadata, 0o644); err != nil {
 		t.Fatalf("write rig metadata: %v", err)
+	}
+	townMetadata := []byte(`{"dolt_database":"town","dolt_server_host":"127.0.0.1","dolt_server_port":3307}`)
+	if err := os.WriteFile(filepath.Join(townBeads, "metadata.json"), townMetadata, 0o644); err != nil {
+		t.Fatalf("write town metadata: %v", err)
 	}
 
 	binDir := filepath.Join(tmp, "bin")
@@ -421,17 +428,17 @@ esac
 	}
 
 	for _, line := range strings.Split(log, "\n") {
-		if !strings.Contains(line, "BEADS_DIR="+rigBeads) {
-			t.Fatalf("bd call was not pinned to rig beads %q: %s\nfull log:\n%s", rigBeads, line, log)
+		if !strings.Contains(line, "BEADS_DIR="+townBeads) {
+			t.Fatalf("bd call was not pinned to town beads %q: %s\nfull log:\n%s", townBeads, line, log)
 		}
-		if strings.Contains(line, "BEADS_DIR="+townBeads) {
-			t.Fatalf("bd call used inherited town BEADS_DIR %q: %s\nfull log:\n%s", townBeads, line, log)
+		if strings.Contains(line, "BEADS_DIR="+rigBeads) {
+			t.Fatalf("bd call used rig BEADS_DIR %q: %s\nfull log:\n%s", rigBeads, line, log)
 		}
-		if !strings.Contains(line, "DB=rigdb") {
-			t.Fatalf("bd call was not pinned to rig database: %s\nfull log:\n%s", line, log)
+		if !strings.Contains(line, "DB=town") {
+			t.Fatalf("bd call was not pinned to town database: %s\nfull log:\n%s", line, log)
 		}
-		if strings.Contains(line, "DB=town") {
-			t.Fatalf("bd call used inherited town database: %s\nfull log:\n%s", line, log)
+		if strings.Contains(line, "DB=rigdb") {
+			t.Fatalf("bd call used rig database: %s\nfull log:\n%s", line, log)
 		}
 		if strings.Contains(line, "cmd=show") {
 			if !strings.Contains(line, "READONLY=true") || !strings.Contains(line, "AUTO=off") {
