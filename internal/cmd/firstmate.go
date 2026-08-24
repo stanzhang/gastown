@@ -83,7 +83,14 @@ Examples:
     --instructions "Run focused tests and report evidence back through FirstMate"`,
 		Args: cobra.ExactArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runFirstmateDelegate(cmd.Context(), cmd.OutOrStdout(), cmd.ErrOrStderr(), args[0], args[1], opts, deps)
+			err := runFirstmateDelegate(cmd.Context(), cmd.OutOrStdout(), cmd.ErrOrStderr(), args[0], args[1], opts, deps)
+			if _, silent := IsSilentExit(err); silent {
+				// fm-send already emitted its authoritative stderr. Prevent Cobra from
+				// appending "Error: exit N" or usage text to the recovery contract.
+				cmd.SilenceErrors = true
+				cmd.SilenceUsage = true
+			}
+			return err
 		},
 	}
 	delegateCmd.Flags().StringVar(&opts.root, "firstmate-root", "", "FirstMate code checkout containing tracked bin/fm-send.sh (env: FIRSTMATE_ROOT or FM_ROOT_OVERRIDE)")
