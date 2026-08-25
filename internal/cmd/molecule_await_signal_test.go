@@ -206,6 +206,166 @@ func TestWaitForEventsFile_Signal(t *testing.T) {
 	}
 }
 
+func TestShouldWakeForEventLine(t *testing.T) {
+	scope := newAwaitSignalScope("gt-gastown-witness")
+	if scope.identity != "gastown/witness" || scope.rig != "gastown" {
+		t.Fatalf("newAwaitSignalScope() = %+v, want gastown/witness in gastown", scope)
+	}
+	otherPrefixScope := newAwaitSignalScope("bd-beads-witness")
+	if otherPrefixScope.identity != "beads/witness" || otherPrefixScope.rig != "beads" {
+		t.Fatalf("newAwaitSignalScope() = %+v, want beads/witness in beads", otherPrefixScope)
+	}
+
+	tests := []struct {
+		name string
+		line string
+		want bool
+	}{
+		{
+			name: "self mail does not wake",
+			line: `{"ts":"now","source":"gt","type":"mail","actor":"gastown/witness/","payload":{"to":"gastown/witness"}}`,
+			want: false,
+		},
+		{
+			name: "unrelated cross-rig traffic does not wake",
+			line: `{"ts":"now","source":"gt","type":"spawn","actor":"gt","payload":{"rig":"beads","polecat":"ruby"}}`,
+			want: false,
+		},
+		{
+			name: "direct mail wakes with trailing slash variant",
+			line: `{"ts":"now","source":"gt","type":"mail","actor":"beads/witness","payload":{"to":"gastown/witness/"}}`,
+			want: true,
+		},
+		{
+			name: "direct nudge wakes with session-name target",
+			line: `{"ts":"now","source":"gt","type":"nudge","actor":"beads/witness","payload":{"target":"gt-witness"}}`,
+			want: true,
+		},
+		{
+			name: "assigned work wakes",
+			line: `{"ts":"now","source":"gt","type":"sling","actor":"mayor/","payload":{"bead":"gt-work","target":"gastown/witness"}}`,
+			want: true,
+		},
+		{
+			name: "hooked work wakes despite target-as-actor encoding",
+			line: `{"ts":"now","source":"gt","type":"hook","actor":"gastown/witness/","payload":{"bead":"gt-work"}}`,
+			want: true,
+		},
+		{
+			name: "same rig activity wakes",
+			line: `{"ts":"now","source":"gt","type":"done","actor":"gastown/polecats/ruby","payload":{"bead":"gt-work"}}`,
+			want: true,
+		},
+		{
+			name: "self patrol activity does not wake",
+			line: `{"ts":"now","source":"gt","type":"patrol_complete","actor":"gastown/witness","payload":{"rig":"gastown"}}`,
+			want: false,
+		},
+		{
+			name: "malformed event wakes fail open",
+			line: `{not-json}`,
+			want: true,
+		},
+		{
+			name: "known event missing required routing wakes fail open",
+			line: `{"ts":"now","source":"gt","type":"mail","actor":"beads/witness","payload":{}}`,
+			want: true,
+		},
+		{
+			name: "unknown event wakes fail open",
+			line: `{"ts":"now","source":"third-party","type":"future_event","actor":"beads/witness"}`,
+			want: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := shouldWakeForEventLine(tt.line, scope); got != tt.want {
+				t.Errorf("shouldWakeForEventLine() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestShouldWakeForEventLineTownPatrolRetainsFailSafeCoverage(t *testing.T) {
+	scope := newAwaitSignalScope("hq-deacon")
+	if scope.identity != "deacon/" || scope.rig != "" {
+		t.Fatalf("newAwaitSignalScope() = %+v, want deacon/ with no rig", scope)
+	}
+
+	crossRig := `{"ts":"now","source":"gt","type":"done","actor":"beads/polecats/ruby","payload":{"bead":"bd-work"}}`
+	if !shouldWakeForEventLine(crossRig, scope) {
+		t.Fatal("town-level patrol must retain town-wide coverage")
+	}
+
+	selfGenerated := `{"ts":"now","source":"gt","type":"handoff","actor":"deacon/","payload":{"to_session":true}}`
+	if shouldWakeForEventLine(selfGenerated, scope) {
+		t.Fatal("town-level patrol must ignore its own recognized activity")
+	}
+}
+
+func TestWaitForEventsFile_IgnoresIrrelevantUntilRelevant(t *testing.T) {
+	eventsPath := filepath.Join(t.TempDir(), ".events.jsonl")
+	if err := os.WriteFile(eventsPath, []byte(`{"ts":"old","type":"ignore"}`+"\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	go func() {
+		time.Sleep(300 * time.Millisecond)
+		f, err := os.OpenFile(eventsPath, os.O_APPEND|os.O_WRONLY, 0644)
+		if err != nil {
+			return
+		}
+		defer f.Close()
+		_, _ = f.WriteString(
+			`{"ts":"new","source":"gt","type":"spawn","actor":"gt","payload":{"rig":"beads","polecat":"ruby"}}` + "\n" +
+				`{"ts":"new","source":"gt","type":"mail","actor":"beads/witness","payload":{"to":"gastown/witness/"}}` + "\n",
+		)
+	}()
+
+	result, err := waitForEventsFile(ctx, eventsPath, "gt-gastown-witness")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.Reason != "signal" {
+		t.Fatalf("reason = %q, want signal", result.Reason)
+	}
+	if !strings.Contains(result.Signal, `"type":"mail"`) {
+		t.Fatalf("signal = %q, want directly addressed mail", result.Signal)
+	}
+}
+
+func TestWaitForEventsFile_IrrelevantTrafficStillTimesOut(t *testing.T) {
+	eventsPath := filepath.Join(t.TempDir(), ".events.jsonl")
+	if err := os.WriteFile(eventsPath, nil, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 600*time.Millisecond)
+	defer cancel()
+
+	go func() {
+		time.Sleep(100 * time.Millisecond)
+		f, err := os.OpenFile(eventsPath, os.O_APPEND|os.O_WRONLY, 0644)
+		if err != nil {
+			return
+		}
+		defer f.Close()
+		_, _ = f.WriteString(`{"ts":"new","source":"gt","type":"spawn","actor":"gt","payload":{"rig":"beads","polecat":"ruby"}}` + "\n")
+	}()
+
+	result, err := waitForEventsFile(ctx, eventsPath, "gt-gastown-witness")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.Reason != "timeout" {
+		t.Fatalf("reason = %q, want timeout", result.Reason)
+	}
+}
+
 func TestWaitForActivitySignal_PathWiring(t *testing.T) {
 	// Verify waitForActivitySignal constructs the correct events path from
 	// townRoot. The events file should be at <townRoot>/.events.jsonl.
