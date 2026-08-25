@@ -232,22 +232,26 @@ This removes the pause file and allows the Deacon to work normally.`,
 
 var deaconCleanupOrphansCmd = &cobra.Command{
 	Use:   "cleanup-orphans",
-	Short: "Clean up orphaned claude subagent processes",
-	Long: `Clean up orphaned claude subagent processes.
+	Short: "Assess and clean up orphaned agent sub-processes",
+	Long: `Assess and clean up orphaned agent sub-processes.
 
-Claude Code's Task tool spawns subagent processes that sometimes don't clean up
-properly after completion. These accumulate and consume significant memory.
+Every known agent process is assessed with the same predicate in preview and
+destructive mode. A process is eligible only when all safety filters pass:
+- its runtime name is one managed by Gas Town
+- it has no controlling TTY
+- it is not owned by an active tmux or ACP session
+- it is not managed by a VS Code or Cursor IDE extension
+- it is at least 60 seconds old
+- its working directory resolves inside a Gas Town workspace
 
-Detection is based on TTY column: processes with TTY "?" have no controlling
-terminal. Legitimate claude instances in terminals have a TTY like "pts/0".
+Output includes PID, parent PID, OS user, town root, session ownership evidence,
+and the eligibility decision. Destructive mode re-checks TTY and tmux ownership
+immediately before signaling, then escalates from SIGTERM to SIGKILL on later
+cleanup cycles.
 
-This is safe because:
-- Processes in terminals (your personal sessions) have a TTY - won't be touched
-- Only kills processes that have no controlling terminal
-- These orphans are children of the tmux server with no TTY
-
-Example:
-  gt deacon cleanup-orphans`,
+Examples:
+  gt deacon cleanup-orphans --dry-run  # Report decisions; send zero signals
+  gt deacon cleanup-orphans            # Report decisions; clean eligible orphans`,
 	RunE: runDeaconCleanupOrphans,
 }
 
@@ -377,6 +381,9 @@ var (
 	staleHooksMaxAge time.Duration
 	staleHooksDryRun bool
 
+	// Orphan cleanup flags
+	cleanupOrphansDryRun bool
+
 	// Pause flags
 	pauseReason string
 
@@ -436,6 +443,8 @@ func init() {
 		"Maximum age before a hooked bead is considered stale")
 	deaconStaleHooksCmd.Flags().BoolVar(&staleHooksDryRun, "dry-run", false,
 		"Preview what would be unhooked without making changes")
+	deaconCleanupOrphansCmd.Flags().BoolVar(&cleanupOrphansDryRun, "dry-run", false,
+		"Report safety evidence and decisions without sending signals")
 
 	// Flags for pause
 	deaconPauseCmd.Flags().StringVar(&pauseReason, "reason", "",
@@ -1387,21 +1396,51 @@ func runDeaconResume(cmd *cobra.Command, args []string) error {
 
 // runDeaconCleanupOrphans cleans up orphaned claude subagent processes.
 func runDeaconCleanupOrphans(cmd *cobra.Command, args []string) error {
-	// First, find orphans
-	orphans, err := util.FindOrphanedClaudeProcesses()
+	return runDeaconCleanupOrphansWith(
+		cleanupOrphansDryRun,
+		util.AssessOrphanedClaudeProcesses,
+		util.CleanupAssessedOrphanedClaudeProcesses,
+	)
+}
+
+func runDeaconCleanupOrphansWith(
+	dryRun bool,
+	assess func() ([]util.OrphanProcessAssessment, error),
+	cleanup func([]util.OrphanProcessAssessment) ([]util.CleanupResult, error),
+) error {
+	assessments, err := assess()
 	if err != nil {
 		return fmt.Errorf("finding orphaned processes: %w", err)
 	}
 
-	if len(orphans) == 0 {
-		fmt.Printf("%s No orphaned claude processes found\n", style.Dim.Render("○"))
+	eligible := 0
+	for _, assessment := range assessments {
+		if assessment.Eligible {
+			eligible++
+		}
+		printOrphanProcessAssessment(assessment)
+	}
+
+	if len(assessments) == 0 {
+		fmt.Printf("%s No known agent processes to assess\n", style.Dim.Render("○"))
+	} else {
+		fmt.Printf("%s Assessed %d agent process(es); %d eligible for cleanup\n",
+			style.Bold.Render("●"), len(assessments), eligible)
+	}
+
+	if dryRun {
+		fmt.Printf("%s Dry run - %d eligible candidate(s); zero signals sent\n",
+			style.Dim.Render("○"), eligible)
 		return nil
 	}
 
-	fmt.Printf("%s Found %d orphaned claude process(es)\n", style.Bold.Render("●"), len(orphans))
+	if eligible == 0 {
+		fmt.Printf("%s No eligible orphaned agent processes found\n", style.Dim.Render("○"))
+		return nil
+	}
 
-	// Process them with signal escalation
-	results, err := util.CleanupOrphanedClaudeProcesses()
+	// Process only candidates selected by the exact assessments printed above.
+	results, err := cleanup(assessments)
 	if err != nil {
 		style.PrintWarning("cleanup had errors: %v", err)
 	}
@@ -1438,6 +1477,29 @@ func runDeaconCleanupOrphans(cmd *cobra.Command, args []string) error {
 	}
 
 	return nil
+}
+
+func printOrphanProcessAssessment(assessment util.OrphanProcessAssessment) {
+	town := assessment.Process.TownRoot
+	if town == "" {
+		town = "outside-gas-town"
+	}
+	protectedBy := assessment.ProtectedBy
+	if protectedBy == "" {
+		protectedBy = "none"
+	}
+	fmt.Printf("  %s PID=%d PPID=%d user=%s cmd=%s TTY=%s age=%ds town=%s protected_by=%s decision=%s\n",
+		style.Dim.Render("→"),
+		assessment.Process.PID,
+		assessment.ParentPID,
+		assessment.User,
+		assessment.Process.Cmd,
+		assessment.TTY,
+		assessment.Process.Age,
+		town,
+		protectedBy,
+		assessment.Decision,
+	)
 }
 
 // runDeaconZombieScan finds and cleans zombie Claude processes not in active tmux sessions.

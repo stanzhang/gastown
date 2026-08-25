@@ -56,6 +56,99 @@ func TestParseEtime(t *testing.T) {
 	}
 }
 
+func TestAssessOrphanProcessCandidateSafetyFilters(t *testing.T) {
+	base := orphanProcessCandidate{
+		PID:       4242,
+		ParentPID: 101,
+		User:      "test-user",
+		TTY:       "??",
+		Cmd:       "claude",
+		Etime:     "02:00",
+		TownRoot:  "/tmp/test-town",
+	}
+
+	tests := []struct {
+		name         string
+		mutate       func(*orphanProcessCandidate)
+		wantEligible bool
+		wantDecision string
+	}{
+		{
+			name:         "eligible orphan preview",
+			mutate:       func(*orphanProcessCandidate) {},
+			wantEligible: true,
+			wantDecision: "eligible: orphan cleanup candidate",
+		},
+		{
+			name: "unmanaged runtime",
+			mutate: func(candidate *orphanProcessCandidate) {
+				candidate.Cmd = "unrelated"
+			},
+			wantDecision: "excluded: unmanaged runtime",
+		},
+		{
+			name: "out of town",
+			mutate: func(candidate *orphanProcessCandidate) {
+				candidate.TownRoot = ""
+			},
+			wantDecision: "excluded: outside Gas Town workspace",
+		},
+		{
+			name: "IDE managed",
+			mutate: func(candidate *orphanProcessCandidate) {
+				candidate.IDE = true
+			},
+			wantDecision: "excluded: IDE-managed process",
+		},
+		{
+			name: "tmux owned",
+			mutate: func(candidate *orphanProcessCandidate) {
+				candidate.ProtectedBy = "tmux"
+			},
+			wantDecision: "excluded: active tmux session",
+		},
+		{
+			name: "ACP owned",
+			mutate: func(candidate *orphanProcessCandidate) {
+				candidate.ProtectedBy = "ACP"
+			},
+			wantDecision: "excluded: active ACP session",
+		},
+		{
+			name: "young process",
+			mutate: func(candidate *orphanProcessCandidate) {
+				candidate.Etime = "00:59"
+			},
+			wantDecision: "excluded: younger than 60s",
+		},
+		{
+			name: "controlling TTY",
+			mutate: func(candidate *orphanProcessCandidate) {
+				candidate.TTY = "pts/3"
+			},
+			wantDecision: "excluded: has controlling TTY",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			candidate := base
+			test.mutate(&candidate)
+
+			assessment := assessOrphanProcessCandidate(candidate)
+			if assessment.Eligible != test.wantEligible {
+				t.Fatalf("Eligible = %v, want %v", assessment.Eligible, test.wantEligible)
+			}
+			if assessment.Decision != test.wantDecision {
+				t.Errorf("Decision = %q, want %q", assessment.Decision, test.wantDecision)
+			}
+			if assessment.Process.PID != base.PID || assessment.ParentPID != base.ParentPID || assessment.User != base.User {
+				t.Errorf("assessment lost process evidence: %+v", assessment)
+			}
+		})
+	}
+}
+
 func TestFindOrphanedClaudeProcesses(t *testing.T) {
 	// Live test that checks for orphaned processes on the current system.
 	// Should not fail — just returns whatever orphans exist (likely none in CI).

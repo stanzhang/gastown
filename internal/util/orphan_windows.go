@@ -11,6 +11,18 @@ type OrphanedProcess struct {
 	TownRoot string // Gas Town workspace root, or "" if not in any workspace
 }
 
+// OrphanProcessAssessment records the evidence used to decide whether an agent
+// process is safe to clean up. Orphan cleanup is unsupported on Windows.
+type OrphanProcessAssessment struct {
+	Process     OrphanedProcess
+	ParentPID   int
+	User        string
+	TTY         string
+	ProtectedBy string
+	Decision    string
+	Eligible    bool
+}
+
 // CleanupResult describes what happened to an orphaned process.
 // On Windows, cleanup is a no-op.
 type CleanupResult struct {
@@ -42,8 +54,18 @@ func FindOrphanedClaudeProcesses() ([]OrphanedProcess, error) {
 	return nil, nil
 }
 
+// AssessOrphanedClaudeProcesses is a Windows stub.
+func AssessOrphanedClaudeProcesses() ([]OrphanProcessAssessment, error) {
+	return nil, nil
+}
+
 // CleanupOrphanedClaudeProcesses is a Windows stub.
 func CleanupOrphanedClaudeProcesses() ([]CleanupResult, error) {
+	return nil, nil
+}
+
+// CleanupAssessedOrphanedClaudeProcesses is a Windows stub.
+func CleanupAssessedOrphanedClaudeProcesses([]OrphanProcessAssessment) ([]CleanupResult, error) {
 	return nil, nil
 }
 

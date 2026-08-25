@@ -424,8 +424,74 @@ type OrphanedProcess struct {
 	TownRoot string // Gas Town workspace root, or "" if not in any workspace
 }
 
-// FindOrphanedClaudeProcesses finds Gas Town agent processes (claude/codex/opencode/cursor-agent/copilot, etc.)
-// without a controlling terminal.
+// OrphanProcessAssessment records the evidence used to decide whether an agent
+// process is safe to clean up. Eligible processes are the only processes passed
+// to the signal escalation state machine.
+type OrphanProcessAssessment struct {
+	Process     OrphanedProcess
+	ParentPID   int
+	User        string
+	TTY         string
+	ProtectedBy string
+	Decision    string
+	Eligible    bool
+}
+
+type orphanProcessCandidate struct {
+	PID         int
+	ParentPID   int
+	User        string
+	TTY         string
+	Cmd         string
+	Etime       string
+	TownRoot    string
+	ProtectedBy string
+	IDE         bool
+}
+
+// assessOrphanProcessCandidate is the single eligibility predicate shared by
+// preview and destructive cleanup. Keep every safety exclusion here so the two
+// modes cannot drift apart.
+func assessOrphanProcessCandidate(candidate orphanProcessCandidate) OrphanProcessAssessment {
+	age, ageErr := parseEtime(candidate.Etime)
+	assessment := OrphanProcessAssessment{
+		Process: OrphanedProcess{
+			PID:      candidate.PID,
+			Cmd:      candidate.Cmd,
+			Age:      age,
+			TownRoot: candidate.TownRoot,
+		},
+		ParentPID:   candidate.ParentPID,
+		User:        candidate.User,
+		TTY:         candidate.TTY,
+		ProtectedBy: candidate.ProtectedBy,
+	}
+
+	switch {
+	case !isAgentOrphanCommName(strings.ToLower(candidate.Cmd)):
+		assessment.Decision = "excluded: unmanaged runtime"
+	case candidate.TTY != "?" && candidate.TTY != "??":
+		assessment.Decision = "excluded: has controlling TTY"
+	case candidate.ProtectedBy != "":
+		assessment.Decision = "excluded: active " + candidate.ProtectedBy + " session"
+	case candidate.IDE:
+		assessment.Decision = "excluded: IDE-managed process"
+	case ageErr != nil:
+		assessment.Decision = "excluded: elapsed time unavailable"
+	case age < minOrphanAge:
+		assessment.Decision = fmt.Sprintf("excluded: younger than %ds", minOrphanAge)
+	case candidate.TownRoot == "":
+		assessment.Decision = "excluded: outside Gas Town workspace"
+	default:
+		assessment.Decision = "eligible: orphan cleanup candidate"
+		assessment.Eligible = true
+	}
+
+	return assessment
+}
+
+// AssessOrphanedClaudeProcesses evaluates Gas Town agent processes
+// (claude/codex/opencode/cursor-agent/copilot, etc.) for orphan cleanup.
 // These are typically subagent processes spawned by Claude Code's Task tool that didn't
 // clean up properly after completion.
 //
@@ -437,30 +503,27 @@ type OrphanedProcess struct {
 //
 // Additionally, processes must be older than minOrphanAge seconds to be considered
 // orphaned. This prevents race conditions with newly spawned processes.
-func FindOrphanedClaudeProcesses() ([]OrphanedProcess, error) {
+func AssessOrphanedClaudeProcesses() ([]OrphanProcessAssessment, error) {
 	// Get PIDs belonging to valid Gas Town tmux sessions.
 	// These should not be killed even if they show TTY "?" during startup.
-	protectedPIDs := getTmuxSessionPIDs()
+	tmuxPIDs := getTmuxSessionPIDs()
 
 	// Also protect ACP sessions (opencode agents running outside tmux)
 	// ACP sessions have their own lifecycle management and should not be killed
 	acpPIDs := getACPSessionPIDs()
-	for pid := range acpPIDs {
-		protectedPIDs[pid] = true
-	}
 
-	// Use ps to get PID, TTY, command, and elapsed time for all processes
+	// Use ps to get process identity, parent/owner evidence, TTY, command, and age.
 	// TTY "?" indicates no controlling terminal
 	// etime is elapsed time in [[DD-]HH:]MM:SS format (portable across Linux/macOS)
-	out, err := exec.Command("ps", "-eo", "pid,tty,comm,etime").Output()
+	out, err := exec.Command("ps", "-eo", "pid,ppid,user,tty,comm,etime").Output()
 	if err != nil {
 		return nil, fmt.Errorf("listing processes: %w", err)
 	}
 
-	var orphans []OrphanedProcess
+	var assessments []OrphanProcessAssessment
 	for _, line := range strings.Split(string(out), "\n") {
 		fields := strings.Fields(line)
-		if len(fields) < 4 {
+		if len(fields) < 6 {
 			continue
 		}
 
@@ -468,16 +531,15 @@ func FindOrphanedClaudeProcesses() ([]OrphanedProcess, error) {
 		if err != nil {
 			continue // Header line or invalid PID
 		}
-
-		tty := fields[1]
-		cmd := fields[2]
-		etimeStr := fields[3]
-
-		// Only look for claude/codex processes without a TTY
-		// Linux shows "?" for no TTY, macOS shows "??"
-		if tty != "?" && tty != "??" {
+		parentPID, err := strconv.Atoi(fields[1])
+		if err != nil {
 			continue
 		}
+
+		user := fields[2]
+		tty := fields[3]
+		cmd := fields[4]
+		etimeStr := fields[5]
 
 		// Match known agent comm names (claude family, opencode, Cursor, Copilot CLI)
 		cmdLower := strings.ToLower(cmd)
@@ -485,46 +547,46 @@ func FindOrphanedClaudeProcesses() ([]OrphanedProcess, error) {
 			continue
 		}
 
-		// Skip processes that belong to valid Gas Town tmux sessions.
-		// This prevents killing witnesses/refineries/deacon during startup
-		// when they may temporarily show TTY "?".
-		if protectedPIDs[pid] {
-			continue
+		var protectedBy string
+		switch {
+		case tmuxPIDs[pid] && acpPIDs[pid]:
+			protectedBy = "tmux+ACP"
+		case tmuxPIDs[pid]:
+			protectedBy = "tmux"
+		case acpPIDs[pid]:
+			protectedBy = "ACP"
 		}
 
-		// Skip IDE extension processes (VS Code, Cursor, etc.).
-		// These have TTY "?" but are legitimate — controlled by the IDE.
-		if isIDEClaudeProcess(pid) {
-			continue
-		}
-
-		// Skip processes younger than minOrphanAge seconds
-		// This prevents killing newly spawned subagents and reduces false positives
-		age, err := parseEtime(etimeStr)
-		if err != nil {
-			continue
-		}
-		if age < minOrphanAge {
-			continue
-		}
-
-		// Skip processes NOT in a Gas Town workspace.
-		// Only kill orphaned Claude processes whose cwd is under a Gas Town
-		// workspace root. This prevents killing user's Claude Code instances
-		// running in repos outside ~/gt/ (or wherever the workspace is).
-		townRoot := resolveTownRoot(pid)
-		if townRoot == "" {
-			continue
-		}
-
-		orphans = append(orphans, OrphanedProcess{
-			PID:      pid,
-			Cmd:      cmd,
-			Age:      age,
-			TownRoot: townRoot,
-		})
+		assessments = append(assessments, assessOrphanProcessCandidate(orphanProcessCandidate{
+			PID:         pid,
+			ParentPID:   parentPID,
+			User:        user,
+			TTY:         tty,
+			Cmd:         cmd,
+			Etime:       etimeStr,
+			TownRoot:    resolveTownRoot(pid),
+			ProtectedBy: protectedBy,
+			IDE:         isIDEClaudeProcess(pid),
+		}))
 	}
 
+	return assessments, nil
+}
+
+// FindOrphanedClaudeProcesses returns only processes that passed the shared
+// safety assessment used by both dry-run and destructive cleanup.
+func FindOrphanedClaudeProcesses() ([]OrphanedProcess, error) {
+	assessments, err := AssessOrphanedClaudeProcesses()
+	if err != nil {
+		return nil, err
+	}
+
+	var orphans []OrphanedProcess
+	for _, assessment := range assessments {
+		if assessment.Eligible {
+			orphans = append(orphans, assessment.Process)
+		}
+	}
 	return orphans, nil
 }
 
@@ -777,9 +839,22 @@ func CleanupZombieClaudeProcesses() ([]ZombieCleanupResult, error) {
 //
 // Returns the list of cleanup results and any error encountered.
 func CleanupOrphanedClaudeProcesses() ([]CleanupResult, error) {
-	orphans, err := FindOrphanedClaudeProcesses()
+	assessments, err := AssessOrphanedClaudeProcesses()
 	if err != nil {
 		return nil, err
+	}
+	return CleanupAssessedOrphanedClaudeProcesses(assessments)
+}
+
+// CleanupAssessedOrphanedClaudeProcesses applies signal escalation only to
+// candidates marked eligible by AssessOrphanedClaudeProcesses. Callers can use
+// the same assessment slice for explicit reporting and cleanup.
+func CleanupAssessedOrphanedClaudeProcesses(assessments []OrphanProcessAssessment) ([]CleanupResult, error) {
+	var orphans []OrphanedProcess
+	for _, assessment := range assessments {
+		if assessment.Eligible {
+			orphans = append(orphans, assessment.Process)
+		}
 	}
 
 	// Load previous state
