@@ -3170,6 +3170,10 @@ func TestParseAgentBeadID(t *testing.T) {
 		{"ff-polecat-nux", "ff", "polecat", "nux", true},         // collapsed named agent
 		{"ff-crew-dave", "ff", "crew", "dave", true},             // collapsed named agent
 		{"ff-polecat-war-boy", "ff", "polecat", "war-boy", true}, // collapsed named with hyphen
+		// Collapsed form also supports prefixes longer than three characters.
+		{"qlib-witness", "qlib", "witness", "", true},
+		{"qlib-refinery", "qlib", "refinery", "", true},
+		{"qlib-polecat-nux", "qlib", "polecat", "nux", true},
 		// Parseable but not valid agent roles (IsAgentSessionBead will reject)
 		{"gt-abc123", "", "abc123", "", true}, // Parses as town-level but not valid role
 		// Other prefixes (bd-, hq-)
@@ -3178,8 +3182,7 @@ func TestParseAgentBeadID(t *testing.T) {
 		{"bd-beads-polecat-pearl", "beads", "polecat", "pearl", true}, // bd prefix rig-level named
 		{"hq-mayor", "", "mayor", "", true},                           // hq prefix town-level
 		// Truly invalid patterns
-		{"x-mayor", "", "", "", false},    // Prefix too short (1 char)
-		{"abcd-mayor", "", "", "", false}, // Prefix too long (4 chars)
+		{"x-mayor", "", "", "", false}, // Prefix too short (1 char)
 		{"", "", "", "", false},
 	}
 

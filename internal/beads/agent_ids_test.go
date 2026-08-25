@@ -66,6 +66,8 @@ func TestAgentBeadIDWithPrefix(t *testing.T) {
 		{"dedup polecat", "ff", "ff", "polecat", "nux", "ff-polecat-nux"},
 		{"dedup crew", "ff", "ff", "crew", "dave", "ff-crew-dave"},
 		{"dedup bd-beads", "bd", "bd", "witness", "", "bd-witness"},
+		{"dedup long prefix witness", "qlib", "qlib", "witness", "", "qlib-witness"},
+		{"dedup long prefix refinery", "qlib", "qlib", "refinery", "", "qlib-refinery"},
 	}
 
 	for _, tt := range tests {
@@ -135,6 +137,8 @@ func TestValidateAgentID(t *testing.T) {
 		{"collapsed refinery", "gt-refinery", false, ""},
 		{"collapsed polecat", "ff-polecat-nux", false, ""},
 		{"collapsed crew", "ff-crew-dave", false, ""},
+		{"collapsed witness with long prefix", "qlib-witness", false, ""},
+		{"collapsed refinery with long prefix", "qlib-refinery", false, ""},
 
 		// Invalid: named agent without name
 		{"crew no name", "gt-beads-crew", true, "requires name"},
@@ -238,6 +242,8 @@ func TestAgentBeadIDRoundTrip(t *testing.T) {
 		{"collapsed refinery", "ff", "ff", "refinery", ""},
 		{"collapsed polecat", "ff", "ff", "polecat", "nux"},
 		{"collapsed crew", "ff", "ff", "crew", "dave"},
+		{"collapsed witness with long prefix", "qlib", "qlib", "witness", ""},
+		{"collapsed refinery with long prefix", "qlib", "qlib", "refinery", ""},
 	}
 
 	for _, tt := range tests {
@@ -265,4 +271,3 @@ func TestAgentBeadIDRoundTrip(t *testing.T) {
 		})
 	}
 }
-
