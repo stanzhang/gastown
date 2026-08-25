@@ -205,6 +205,46 @@ func TestDeaconPatrolDoesNotRunAgeBasedWispGC(t *testing.T) {
 	}
 }
 
+// TestDeaconPatrolUsesSupportedDaemonStatusContract verifies the patrol uses
+// the daemon status command's supported exit-status contract. The command has
+// no JSON flag, so patrol instructions must neither request it nor hide errors.
+func TestDeaconPatrolUsesSupportedDaemonStatusContract(t *testing.T) {
+	content, err := formulasFS.ReadFile("formulas/mol-deacon-patrol.formula.toml")
+	if err != nil {
+		t.Fatalf("reading deacon patrol formula: %v", err)
+	}
+
+	f, err := Parse(content)
+	if err != nil {
+		t.Fatalf("parsing deacon patrol formula: %v", err)
+	}
+
+	var maintenanceDesc string
+	for _, step := range f.Steps {
+		if step.ID == "log-maintenance" {
+			maintenanceDesc = step.Description
+			break
+		}
+	}
+	if maintenanceDesc == "" {
+		t.Fatal("deacon patrol formula: log-maintenance step not found or empty")
+	}
+	if !strings.Contains(maintenanceDesc, "if ! gt daemon status; then") {
+		t.Fatal("log-maintenance must fail visibly when supported daemon status fails")
+	}
+	if strings.Contains(maintenanceDesc, "gt daemon status --json") {
+		t.Fatal("log-maintenance uses unsupported daemon status --json contract")
+	}
+	for _, maskedFailure := range []string{"2>/dev/null", "2>&1", "|| true"} {
+		if strings.Contains(maintenanceDesc, "gt daemon status "+maskedFailure) {
+			t.Fatalf("log-maintenance silently masks daemon status errors with %q", maskedFailure)
+		}
+	}
+	if !strings.Contains(maintenanceDesc, "Do not parse its") || !strings.Contains(maintenanceDesc, "formatted output") {
+		t.Fatal("log-maintenance must forbid parsing formatted daemon status output")
+	}
+}
+
 // TestPatrolFormulasUseDynamicBeadResolution verifies that patrol formulas
 // resolve their agent bead ID dynamically at runtime via `gt agents resolve`,
 // rather than hardcoding a prefix like `gt-<rig>-refinery`.

@@ -60,14 +60,14 @@ func TestBuildReport(t *testing.T) {
 		Skipped: 5,
 	}
 
-	activeWisps := []*compactIssue{
-		{Issue: beads.Issue{ID: "w-10"}, WispType: "heartbeat"},
-		{Issue: beads.Issue{ID: "w-11"}, WispType: "patrol"},
-		{Issue: beads.Issue{ID: "w-12"}, WispType: "patrol"},
-		{Issue: beads.Issue{ID: "w-13"}, WispType: "error"},
+	currentWisps := []*compactIssue{
+		{Issue: beads.Issue{ID: "w-10", Status: "open"}, WispType: "heartbeat"},
+		{Issue: beads.Issue{ID: "w-11", Status: "open"}, WispType: "patrol"},
+		{Issue: beads.Issue{ID: "w-12", Status: "closed"}, WispType: "patrol"},
+		{Issue: beads.Issue{ID: "w-13", Status: "hooked"}, WispType: "error"},
 	}
 
-	report := buildReport("2026-02-09", result, activeWisps)
+	report := buildReport("2026-02-09", result, currentWisps)
 
 	if report.Date != "2026-02-09" {
 		t.Errorf("Date = %q, want %q", report.Date, "2026-02-09")
@@ -81,14 +81,20 @@ func TestBuildReport(t *testing.T) {
 	if hb.Active != 1 {
 		t.Errorf("Heartbeats.Active = %d, want 1", hb.Active)
 	}
+	if hb.Total != 1 {
+		t.Errorf("Heartbeats.Total = %d, want 1", hb.Total)
+	}
 
 	// Check patrols category
 	p := report.Categories["Patrols"]
 	if p.Deleted != 1 {
 		t.Errorf("Patrols.Deleted = %d, want 1", p.Deleted)
 	}
-	if p.Active != 2 {
-		t.Errorf("Patrols.Active = %d, want 2", p.Active)
+	if p.Active != 1 {
+		t.Errorf("Patrols.Active = %d, want 1 open wisp", p.Active)
+	}
+	if p.Total != 2 {
+		t.Errorf("Patrols.Total = %d, want 2 all-status wisps", p.Total)
 	}
 
 	// Check errors category
@@ -96,8 +102,23 @@ func TestBuildReport(t *testing.T) {
 	if e.Promoted != 1 {
 		t.Errorf("Errors.Promoted = %d, want 1", e.Promoted)
 	}
-	if e.Active != 1 {
-		t.Errorf("Errors.Active = %d, want 1", e.Active)
+	if e.Active != 0 {
+		t.Errorf("Errors.Active = %d, want 0 open wisps", e.Active)
+	}
+	if e.Total != 1 {
+		t.Errorf("Errors.Total = %d, want 1 all-status wisp", e.Total)
+	}
+
+	var activePopulation, totalPopulation int
+	for _, stats := range report.Categories {
+		activePopulation += stats.Active
+		totalPopulation += stats.Total
+	}
+	if activePopulation != 2 {
+		t.Errorf("active population = %d, want 2 source wisps with status=open", activePopulation)
+	}
+	if totalPopulation != len(currentWisps) {
+		t.Errorf("total population = %d, want all %d source wisps", totalPopulation, len(currentWisps))
 	}
 
 	// Check promotions list
@@ -346,10 +367,10 @@ func TestFormatDailyDigest(t *testing.T) {
 	report := &compactReport{
 		Date: "2026-02-09",
 		Categories: map[string]*categoryStats{
-			"Heartbeats": {Deleted: 2847, Promoted: 0, Active: 23},
-			"Patrols":    {Deleted: 42, Promoted: 1, Active: 48},
-			"Errors":     {Deleted: 2, Promoted: 3, Active: 7},
-			"Untyped":    {Deleted: 15, Promoted: 0, Active: 4},
+			"Heartbeats": {Deleted: 2847, Promoted: 0, Active: 23, Total: 90},
+			"Patrols":    {Deleted: 42, Promoted: 1, Active: 48, Total: 55},
+			"Errors":     {Deleted: 2, Promoted: 3, Active: 7, Total: 12},
+			"Untyped":    {Deleted: 15, Promoted: 0, Active: 4, Total: 20},
 		},
 		Promotions: []compactAction{
 			{ID: "gt-wisp-abc", Title: "Polecat crash during convoy", Reason: "has comments"},
@@ -366,7 +387,10 @@ func TestFormatDailyDigest(t *testing.T) {
 	if !strings.Contains(md, "### Summary") {
 		t.Error("missing summary section")
 	}
-	if !strings.Contains(md, "| Heartbeats | 2847 | 0 | 23 |") {
+	if !strings.Contains(md, "Active is the current `status=open` population") {
+		t.Error("missing active/total semantics")
+	}
+	if !strings.Contains(md, "| Heartbeats | 2847 | 0 | 23 | 90 |") {
 		t.Error("missing heartbeats row")
 	}
 	if !strings.Contains(md, "### Promotions") {
@@ -414,10 +438,10 @@ func TestFormatWeeklyRollup(t *testing.T) {
 		WeekEnd:   "2026-02-09",
 		Days:      7,
 		Totals: map[string]*categoryStats{
-			"Heartbeats": {Deleted: 15000, Promoted: 0, Active: 25},
-			"Patrols":    {Deleted: 280, Promoted: 5, Active: 50},
-			"Errors":     {Deleted: 10, Promoted: 8, Active: 3},
-			"Untyped":    {Deleted: 90, Promoted: 2, Active: 6},
+			"Heartbeats": {Deleted: 15000, Promoted: 0, Active: 25, Total: 100},
+			"Patrols":    {Deleted: 280, Promoted: 5, Active: 50, Total: 80},
+			"Errors":     {Deleted: 10, Promoted: 8, Active: 3, Total: 15},
+			"Untyped":    {Deleted: 90, Promoted: 2, Active: 6, Total: 12},
 		},
 		Promotions: 15,
 		Anomalies:  []string{"high heartbeat volume on 2026-02-05"},
@@ -433,6 +457,12 @@ func TestFormatWeeklyRollup(t *testing.T) {
 	}
 	if !strings.Contains(md, "### Totals") {
 		t.Error("missing totals section")
+	}
+	if !strings.Contains(md, "Active is `status=open`; Total includes all statuses") {
+		t.Error("missing weekly active/total semantics")
+	}
+	if !strings.Contains(md, "| Heartbeats | 15000 | 0 | 25 | 100 |") {
+		t.Error("missing weekly heartbeats populations")
 	}
 	if !strings.Contains(md, "### Rates") {
 		t.Error("missing rates section")

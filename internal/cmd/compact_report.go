@@ -75,7 +75,8 @@ const zeroPatrolReportingGap = "0 eligible patrol wisps in the report query/wind
 type categoryStats struct {
 	Deleted  int `json:"deleted"`
 	Promoted int `json:"promoted"`
-	Active   int `json:"active"`
+	Active   int `json:"active"` // Current wisps whose issue status is open.
+	Total    int `json:"total"`  // Current wisps across all issue statuses.
 }
 
 // compactReport is the full daily digest data.
@@ -102,8 +103,9 @@ var compactReportCmd = &cobra.Command{
 	Short: "Generate and send compaction digest report",
 	Long: `Generate a compaction digest and send it to deacon/ (cc mayor/).
 
-The daily digest shows per-category breakdown of deleted, promoted, and active
-wisps, plus any promotions with reasons and detected anomalies.
+The daily digest shows per-category breakdown of deleted and promoted wisps,
+current open wisps (Active), and current wisps across all statuses (Total), plus
+any promotions with reasons and detected anomalies.
 
 The weekly rollup (--weekly) aggregates the past 7 days of compaction event
 beads and sends trend data to mayor/.
@@ -167,19 +169,20 @@ func runDailyDigest() error {
 		return fmt.Errorf("parsing compaction output: %w", err)
 	}
 
-	// Query active wisps for the "Active" column
+	// Query the full current wisp population. buildReport separates open
+	// ("Active") wisps from the all-status total.
 	workDir, err := os.Getwd()
 	if err != nil {
 		return fmt.Errorf("getting working dir: %w", err)
 	}
 	bd := beads.New(workDir)
-	activeWisps, err := listReportWisps(bd)
+	currentWisps, err := listReportWisps(bd)
 	if err != nil {
-		return fmt.Errorf("listing active wisps: %w", err)
+		return fmt.Errorf("listing current wisps: %w", err)
 	}
 
 	// Build report
-	report := buildReport(dateStr, &result, activeWisps)
+	report := buildReport(dateStr, &result, currentWisps)
 
 	// Detect anomalies
 	report.Anomalies = detectAnomalies(report)
@@ -242,7 +245,7 @@ func listReportWisps(bd *beads.Beads) ([]*compactIssue, error) {
 }
 
 // buildReport aggregates compaction results by category.
-func buildReport(dateStr string, result *compactResult, activeWisps []*compactIssue) *compactReport {
+func buildReport(dateStr string, result *compactResult, currentWisps []*compactIssue) *compactReport {
 	report := &compactReport{
 		Date:       dateStr,
 		Categories: make(map[string]*categoryStats),
@@ -267,10 +270,15 @@ func buildReport(dateStr string, result *compactResult, activeWisps []*compactIs
 		report.Promotions = append(report.Promotions, p)
 	}
 
-	// Tally active wisps by category
-	for _, w := range activeWisps {
+	// Tally the all-status population separately from open ("Active") wisps.
+	// listReportWisps deliberately uses --all so closed and other non-open rows
+	// remain visible in Total without being mislabeled as Active.
+	for _, w := range currentWisps {
 		cat := wispTypeToCategory(w.WispType, w.Title)
-		report.Categories[cat].Active++
+		report.Categories[cat].Total++
+		if w.Status == string(beads.StatusOpen) {
+			report.Categories[cat].Active++
+		}
 	}
 
 	return report
@@ -326,17 +334,18 @@ func formatDailyDigest(report *compactReport) string {
 
 	// Summary table
 	sb.WriteString("### Summary\n")
-	sb.WriteString("| Category | Deleted | Promoted | Active |\n")
-	sb.WriteString("|----------|---------|----------|--------|\n")
+	sb.WriteString("Active is the current `status=open` population; Total includes current wisps in all statuses.\n\n")
+	sb.WriteString("| Category | Deleted | Promoted | Active (open) | Total (all statuses) |\n")
+	sb.WriteString("|----------|---------|----------|---------------|----------------------|\n")
 
 	for _, cat := range categoryOrder {
 		stats := report.Categories[cat]
 		// Skip empty categories
-		if stats.Deleted == 0 && stats.Promoted == 0 && stats.Active == 0 {
+		if stats.Deleted == 0 && stats.Promoted == 0 && stats.Active == 0 && stats.Total == 0 {
 			continue
 		}
-		sb.WriteString(fmt.Sprintf("| %s | %d | %d | %d |\n",
-			cat, stats.Deleted, stats.Promoted, stats.Active))
+		sb.WriteString(fmt.Sprintf("| %s | %d | %d | %d | %d |\n",
+			cat, stats.Deleted, stats.Promoted, stats.Active, stats.Total))
 	}
 
 	// Promotions
@@ -468,6 +477,7 @@ func runWeeklyRollup() error {
 			rollup.Totals[cat].Deleted += stats.Deleted
 			rollup.Totals[cat].Promoted += stats.Promoted
 			rollup.Totals[cat].Active = stats.Active // Use latest active count
+			rollup.Totals[cat].Total = stats.Total   // Use latest total count
 		}
 		rollup.Promotions += len(report.Promotions)
 		for _, anomaly := range report.Anomalies {
@@ -608,19 +618,20 @@ func formatWeeklyRollup(rollup *weeklyRollup) string {
 
 	// Totals table
 	sb.WriteString("### Totals\n")
-	sb.WriteString("| Category | Deleted | Promoted | Active (latest) |\n")
-	sb.WriteString("|----------|---------|----------|----------------|\n")
+	sb.WriteString("Active is `status=open`; Total includes all statuses. Both are latest-day snapshots.\n\n")
+	sb.WriteString("| Category | Deleted | Promoted | Active (open, latest) | Total (all statuses, latest) |\n")
+	sb.WriteString("|----------|---------|----------|-----------------------|------------------------------|\n")
 
 	totalDeleted := 0
 	totalPromoted := 0
 
 	for _, cat := range categoryOrder {
 		stats := rollup.Totals[cat]
-		if stats.Deleted == 0 && stats.Promoted == 0 && stats.Active == 0 {
+		if stats.Deleted == 0 && stats.Promoted == 0 && stats.Active == 0 && stats.Total == 0 {
 			continue
 		}
-		sb.WriteString(fmt.Sprintf("| %s | %d | %d | %d |\n",
-			cat, stats.Deleted, stats.Promoted, stats.Active))
+		sb.WriteString(fmt.Sprintf("| %s | %d | %d | %d | %d |\n",
+			cat, stats.Deleted, stats.Promoted, stats.Active, stats.Total))
 		totalDeleted += stats.Deleted
 		totalPromoted += stats.Promoted
 	}
