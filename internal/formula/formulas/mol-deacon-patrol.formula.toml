@@ -1115,17 +1115,20 @@ lumberjack for automatic rotation and is handled separately.
 Log locations: $GT_ROOT/daemon/dolt.log, $GT_ROOT/daemon/dolt-server.log,
 and per-rig .beads/dolt-server.log files.
 
-**Step 2: Prune state.json of dead sessions**
+**Step 2: Verify daemon status and state cleanup ownership**
 
-The state.json tracks active sessions. Prune entries for sessions that no longer exist:
+Use the supported daemon status command as an exit-status check. Do not parse its
+formatted output, and do not suppress failures:
 ```bash
-# Check for stale session entries
-gt daemon status --json 2>/dev/null
+if ! gt daemon status; then
+  echo "ERROR: daemon status check failed; state cleanup not verified" >&2
+  exit 1
+fi
 ```
 
-If state.json references sessions not in tmux:
-- Remove the stale entries
-- The daemon's internal cleanup should handle this, but verify
+The daemon owns pruning dead session entries from state.json. A successful status
+check confirms the daemon is reachable; it does not expose a structured state.json
+inventory, so do not infer or manually parse stale entries from this output.
 
 **Note**: Log rotation prevents disk bloat from long-running daemons.
 State pruning keeps runtime state accurate."""
