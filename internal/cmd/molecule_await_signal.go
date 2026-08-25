@@ -14,6 +14,7 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/events"
+	"github.com/steveyegge/gastown/internal/mail"
 	"github.com/steveyegge/gastown/internal/style"
 	"github.com/steveyegge/gastown/internal/workspace"
 )
@@ -30,11 +31,14 @@ var (
 var moleculeAwaitSignalCmd = &cobra.Command{
 	Use:   "await-signal",
 	Short: "Wait for activity feed signal with timeout",
-	Long: `Wait for any activity on the events feed, with optional backoff.
+	Long: `Wait for relevant activity on the events feed, with optional backoff.
 
-This command is the primary wake mechanism for patrol agents. It tails
-~/gt/.events.jsonl and returns immediately when a new event is appended
-(indicating Gas Town activity such as slings, nudges, mail, spawns, etc.).
+This command is the primary wake mechanism for patrol agents. It tails the
+town-wide ~/gt/.events.jsonl feed. With --agent-bead, it returns for directly
+targeted work or mail and relevant same-rig activity while ignoring recognized
+self-generated and unrelated cross-rig events. Unknown event shapes wake
+fail-open so new producers cannot silently bypass patrols. Without --agent-bead,
+any appended event wakes the command.
 
 If no activity occurs within the timeout, the command returns with exit code 0
 but sets the AWAIT_SIGNAL_REASON environment variable to "timeout".
@@ -222,7 +226,7 @@ func runMoleculeAwaitSignal(cmd *cobra.Command, args []string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
-	result, err := waitForActivitySignal(ctx, townRoot)
+	result, err := waitForActivitySignal(ctx, townRoot, awaitSignalAgentBead)
 	if err != nil {
 		return fmt.Errorf("feed subscription failed: %w", err)
 	}
@@ -362,14 +366,18 @@ func calculateEffectiveTimeout(idleCycles int) (time.Duration, error) {
 // waitForActivitySignal tails the events file for new activity.
 // townRoot is the Gas Town workspace root; the events file is at
 // <townRoot>/.events.jsonl. Returns immediately when a new event line is
-// appended, or when context is canceled.
-func waitForActivitySignal(ctx context.Context, townRoot string) (*AwaitSignalResult, error) {
-	return waitForEventsFile(ctx, filepath.Join(townRoot, events.EventsFile))
+// appended and relevant to agentBead, or when context is canceled.
+func waitForActivitySignal(ctx context.Context, townRoot string, agentBead ...string) (*AwaitSignalResult, error) {
+	return waitForEventsFile(ctx, filepath.Join(townRoot, events.EventsFile), agentBead...)
 }
 
 // waitForEventsFile tails the events file for new lines.
 // This replaces the former bd activity --follow subprocess approach.
-func waitForEventsFile(ctx context.Context, eventsPath string) (*AwaitSignalResult, error) {
+func waitForEventsFile(ctx context.Context, eventsPath string, agentBead ...string) (*AwaitSignalResult, error) {
+	var scope awaitSignalScope
+	if len(agentBead) > 0 {
+		scope = newAwaitSignalScope(agentBead[0])
+	}
 
 	f, err := os.OpenFile(eventsPath, os.O_RDONLY|os.O_CREATE, 0644)
 	if err != nil {
@@ -396,19 +404,241 @@ func waitForEventsFile(ctx context.Context, eventsPath string) (*AwaitSignalResu
 				Reason: "timeout",
 			}, nil
 		case <-ticker.C:
-			line, err := reader.ReadString('\n')
-			if err == nil && line != "" {
-				return &AwaitSignalResult{
-					Reason: "signal",
-					Signal: strings.TrimRight(line, "\n"),
-				}, nil
-			}
-			// io.EOF means no new data yet — keep polling
-			if err != nil && err != io.EOF {
-				return nil, fmt.Errorf("reading events file: %w", err)
+			for {
+				line, err := reader.ReadString('\n')
+				if line != "" && shouldWakeForEventLine(line, scope) {
+					return &AwaitSignalResult{
+						Reason: "signal",
+						Signal: strings.TrimRight(line, "\r\n"),
+					}, nil
+				}
+				// io.EOF means no new data yet — keep polling. Drain all complete
+				// lines first so irrelevant activity cannot delay a relevant wake.
+				if err == io.EOF {
+					break
+				}
+				if err != nil {
+					return nil, fmt.Errorf("reading events file: %w", err)
+				}
 			}
 		}
 	}
+}
+
+// awaitSignalScope identifies the patrol agent waiting on the town-wide feed.
+// An empty identity intentionally disables filtering so callers without an
+// agent bead retain the original fail-safe "wake on anything" behavior.
+type awaitSignalScope struct {
+	identity string
+	rig      string
+	prefix   string
+	session  string
+}
+
+func newAwaitSignalScope(agentBead string) awaitSignalScope {
+	identity := normalizeAwaitSignalIdentity(agentBead)
+	rig, role, name, ok := beads.ParseAgentBeadID(agentBead)
+	if !ok {
+		rig = awaitSignalAddressRig(identity)
+	}
+	prefix, _, _ := strings.Cut(agentBead, "-")
+	return awaitSignalScope{
+		identity: identity,
+		rig:      rig,
+		prefix:   prefix,
+		session:  awaitSignalSessionName(prefix, role, name),
+	}
+}
+
+// shouldWakeForEventLine classifies one entry from the town-wide activity log.
+// Unknown or malformed entries wake fail-open: patrols must not silently miss
+// new event shapes merely because this classifier has not learned them yet.
+func shouldWakeForEventLine(line string, scope awaitSignalScope) bool {
+	if scope.identity == "" {
+		return true
+	}
+
+	var event events.Event
+	if err := json.Unmarshal([]byte(strings.TrimSpace(line)), &event); err != nil {
+		return true
+	}
+	if !knownAwaitSignalEventType(event.Type) {
+		return true
+	}
+	if !wellFormedAwaitSignalEvent(event) {
+		return true
+	}
+
+	actor := normalizeAwaitSignalIdentity(event.Actor)
+
+	// Hook events use the hooked agent as their actor, so this is targeted
+	// work rather than a self-generated patrol event.
+	if event.Type == events.TypeHook && scope.matchesIdentity(event.Actor) {
+		return true
+	}
+
+	// Direct delivery always matters, even when it crosses rig boundaries.
+	for _, key := range []string{"to", "target", "agent"} {
+		if target, ok := event.Payload[key].(string); ok && scope.matchesIdentity(target) {
+			if scope.matchesIdentity(event.Actor) {
+				return false
+			}
+			return true
+		}
+	}
+
+	// Patrol commands emit activity too. Do not let those events immediately
+	// wake the same patrol that produced them.
+	if actor == scope.identity || scope.matchesIdentity(event.Actor) {
+		return false
+	}
+
+	// Town-level patrols (notably the deacon) intentionally retain town-wide
+	// coverage. Only their own recognized events are filtered above.
+	if scope.rig == "" {
+		return true
+	}
+
+	return scope.matchesEventRig(event)
+}
+
+func wellFormedAwaitSignalEvent(event events.Event) bool {
+	if strings.TrimSpace(event.Actor) == "" {
+		return false
+	}
+	requirePayloadString := func(key string) bool {
+		value, ok := event.Payload[key].(string)
+		return ok && strings.TrimSpace(value) != ""
+	}
+
+	switch event.Type {
+	case events.TypeMail:
+		return requirePayloadString("to")
+	case events.TypeSling, events.TypeNudge:
+		return requirePayloadString("target")
+	case events.TypeSpawn:
+		return requirePayloadString("rig")
+	default:
+		return true
+	}
+}
+
+func knownAwaitSignalEventType(eventType string) bool {
+	switch eventType {
+	case events.TypeSling,
+		events.TypeHook,
+		events.TypeUnhook,
+		events.TypeHandoff,
+		events.TypeDone,
+		events.TypeMail,
+		events.TypeSpawn,
+		events.TypeKill,
+		events.TypeNudge,
+		events.TypeBoot,
+		events.TypeHalt,
+		events.TypeSessionStart,
+		events.TypeSessionEnd,
+		events.TypeSessionDeath,
+		events.TypeMassDeath,
+		events.TypePatrolStarted,
+		events.TypePolecatChecked,
+		events.TypePolecatNudged,
+		events.TypeEscalationSent,
+		events.TypeEscalationAcked,
+		events.TypeEscalationClosed,
+		events.TypePatrolComplete,
+		events.TypeMergeStarted,
+		events.TypeMerged,
+		events.TypeMergeFailed,
+		events.TypeMergeSkipped,
+		events.TypeSchedulerEnqueue,
+		events.TypeSchedulerDispatch,
+		events.TypeSchedulerDispatchFailed,
+		events.TypeSchedulerCloseRetry:
+		return true
+	default:
+		return false
+	}
+}
+
+func normalizeAwaitSignalIdentity(identity string) string {
+	identity = strings.TrimSpace(identity)
+	if address := mail.AgentBeadIDToAddress(identity); address != "" {
+		identity = address
+	} else if rig, role, name, ok := beads.ParseAgentBeadID(identity); ok {
+		switch role {
+		case "mayor", "deacon":
+			identity = role
+		case "witness", "refinery":
+			identity = rig + "/" + role
+		case "crew":
+			identity = rig + "/crew/" + name
+		case "polecat":
+			identity = rig + "/polecats/" + name
+		}
+	}
+	return mail.AddressToIdentity(identity)
+}
+
+func awaitSignalSessionName(prefix, role, name string) string {
+	switch role {
+	case "mayor", "deacon":
+		return "hq-" + role
+	case "witness", "refinery":
+		return prefix + "-" + role
+	case "crew":
+		return prefix + "-crew-" + name
+	case "polecat":
+		return prefix + "-" + name
+	default:
+		return ""
+	}
+}
+
+func (scope awaitSignalScope) matchesIdentity(address string) bool {
+	trimmed := strings.TrimSpace(strings.TrimSuffix(address, "/"))
+	return normalizeAwaitSignalIdentity(address) == scope.identity ||
+		(scope.session != "" && trimmed == scope.session)
+}
+
+func (scope awaitSignalScope) matchesEventRig(event events.Event) bool {
+	if scope.matchesAddressRig(event.Actor) {
+		return true
+	}
+	if rig, ok := event.Payload["rig"].(string); ok &&
+		strings.TrimSpace(strings.TrimSuffix(rig, "/")) == scope.rig {
+		return true
+	}
+	for _, key := range []string{"to", "target", "agent"} {
+		if address, ok := event.Payload[key].(string); ok && scope.matchesAddressRig(address) {
+			return true
+		}
+	}
+	return false
+}
+
+func (scope awaitSignalScope) matchesAddressRig(address string) bool {
+	if awaitSignalAddressRig(address) == scope.rig {
+		return true
+	}
+	address = strings.TrimSpace(strings.TrimSuffix(address, "/"))
+	return scope.prefix != "" && strings.HasPrefix(address, scope.prefix+"-")
+}
+
+func awaitSignalAddressRig(address string) string {
+	address = strings.TrimSpace(address)
+	trimmed := strings.TrimSuffix(address, "/")
+	if strings.HasSuffix(address, "/") && !strings.Contains(trimmed, "/") &&
+		trimmed != "mayor" && trimmed != "deacon" {
+		return trimmed
+	}
+
+	normalized := normalizeAwaitSignalIdentity(address)
+	parts := strings.SplitN(normalized, "/", 2)
+	if len(parts) == 2 && parts[0] != "mayor" && parts[0] != "deacon" {
+		return parts[0]
+	}
+	return ""
 }
 
 // parseIntSimple parses a string to int without using strconv.
