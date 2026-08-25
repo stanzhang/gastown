@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -23,7 +22,6 @@ import (
 	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/style"
 	"github.com/steveyegge/gastown/internal/tmux"
-	"github.com/steveyegge/gastown/internal/util"
 )
 
 // debugSession logs non-fatal errors during session startup when GT_DEBUG_SESSION=1.
@@ -859,12 +857,14 @@ func (m *SessionManager) resolveBeadsDir(issueID, fallbackDir string) string {
 // from agents retrying work on invalid issues.
 func (m *SessionManager) validateIssue(issueID, workDir string) error {
 	bdWorkDir := m.resolveBeadsDir(issueID, workDir)
+	canonicalBeadsDir, err := beads.ResolveBeadsDirStrict(bdWorkDir)
+	if err != nil {
+		return fmt.Errorf("resolving beads directory for %s: %w", issueID, err)
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), constants.BdCommandTimeout)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "bd", "show", issueID, "--json") //nolint:gosec // G204: bd is a trusted internal tool
-	util.SetDetachedProcessGroup(cmd)
-	cmd.Dir = bdWorkDir
+	cmd := beads.CommandContext(ctx, bdWorkDir, canonicalBeadsDir, beads.ReadOnlyPinned, "show", issueID, "--json")
 	output, err := cmd.Output()
 	if err != nil {
 		return fmt.Errorf("%w: %s", ErrIssueInvalid, issueID)
@@ -957,12 +957,14 @@ func (m *SessionManager) verifyStartupNudgeDelivery(sessionID string, rc *config
 // hookIssue pins an issue to a polecat's hook using bd update.
 func (m *SessionManager) hookIssue(issueID, agentID, workDir string) error {
 	bdWorkDir := m.resolveBeadsDir(issueID, workDir)
+	canonicalBeadsDir, err := beads.ResolveBeadsDirStrict(bdWorkDir)
+	if err != nil {
+		return fmt.Errorf("resolving beads directory for %s: %w", issueID, err)
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), constants.BdCommandTimeout)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "bd", "update", issueID, "--status=hooked", "--assignee="+agentID) //nolint:gosec // G204: bd is a trusted internal tool
-	util.SetDetachedProcessGroup(cmd)
-	cmd.Dir = bdWorkDir
+	cmd := beads.CommandContext(ctx, bdWorkDir, canonicalBeadsDir, beads.MutationPinned, "update", issueID, "--status=hooked", "--assignee="+agentID)
 	cmd.Stderr = os.Stderr
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("bd update failed: %w", err)

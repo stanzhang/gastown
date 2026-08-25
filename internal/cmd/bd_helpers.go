@@ -195,6 +195,21 @@ func (b *bdCmd) buildContextCommand(ctx context.Context) *exec.Cmd {
 	return cmd
 }
 
+// validateBeadsResolution makes command execution fail closed when a selected
+// working directory contains an unusable redirect. Build remains available for
+// callers that only inspect argv/env; execution helpers enforce the check.
+func (b *bdCmd) validateBeadsResolution() error {
+	target := b.beadsDir
+	if target == "" {
+		target = b.dir
+	}
+	if target == "" {
+		return nil
+	}
+	_, err := beads.ResolveBeadsDirStrict(target)
+	return err
+}
+
 func (b *bdCmd) wrapTimeout(err error, deadline time.Duration) error {
 	if err == nil {
 		return nil
@@ -256,6 +271,9 @@ func (b *bdCmd) resolvedArgs() []string {
 // Run builds and runs the command, returning any error.
 // This is a convenience method equivalent to Build().Run().
 func (b *bdCmd) Run() error {
+	if err := b.validateBeadsResolution(); err != nil {
+		return err
+	}
 	deadline := resolveBdCmdTimeout()
 	ctx, cancel := context.WithTimeout(context.Background(), deadline)
 	defer cancel()
@@ -267,6 +285,9 @@ func (b *bdCmd) Run() error {
 // Note: Output() captures stdout but Stderr must still be configured
 // separately if you want to capture stderr instead of it going to os.Stderr.
 func (b *bdCmd) Output() ([]byte, error) {
+	if err := b.validateBeadsResolution(); err != nil {
+		return nil, err
+	}
 	deadline := resolveBdCmdTimeout()
 	ctx, cancel := context.WithTimeout(context.Background(), deadline)
 	defer cancel()
@@ -278,6 +299,9 @@ func (b *bdCmd) Output() ([]byte, error) {
 // This overrides the configured Stderr writer to capture both streams.
 // Useful for including command output in error messages.
 func (b *bdCmd) CombinedOutput() ([]byte, error) {
+	if err := b.validateBeadsResolution(); err != nil {
+		return nil, err
+	}
 	deadline := resolveBdCmdTimeout()
 	ctx, cancel := context.WithTimeout(context.Background(), deadline)
 	defer cancel()

@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
-	"os/exec"
 	"path/filepath"
 	"strings"
 
@@ -37,8 +36,14 @@ type MoleculeCurrentOutput struct {
 // with execution instructions. This is the core of the Propulsion Principle.
 func showMoleculeExecutionPrompt(workDir, moleculeID string) {
 	// Call bd mol current with JSON output
-	cmd := exec.Command("bd", "mol", "current", moleculeID, "--json")
-	cmd.Dir = workDir
+	beadsDir, resolveErr := beads.ResolveBeadsDirStrict(workDir)
+	if resolveErr != nil {
+		fmt.Printf("%s\n", style.Warning.Render(resolveErr.Error()))
+		fmt.Println(style.Bold.Render("→ PROPULSION PRINCIPLE: Work is on your hook. RUN IT."))
+		fmt.Println("  Resolve the beads redirect safely before querying molecule state.")
+		return
+	}
+	cmd := beads.Command(workDir, beadsDir, beads.ReadOnlyPinned, "mol", "current", moleculeID, "--json")
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr

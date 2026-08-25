@@ -4,12 +4,19 @@ package beads
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 )
+
+const maxBeadsRedirectDepth = 4
+
+// ErrBeadsRedirectResolution classifies redirects that cannot be followed
+// without risking selection of redirect-local state.
+var ErrBeadsRedirectResolution = errors.New("beads redirect resolution failed")
 
 // ResolveBeadsDir returns the actual beads directory, following any redirect.
 // If workDir/.beads/redirect exists, it reads the redirect path and resolves it
@@ -22,92 +29,105 @@ import (
 // the redirect is resolved from crew/max/ (not crew/max/.beads/), giving us
 // mayor/rig/.beads at the rig root level.
 //
-// Circular redirect detection: If the resolved path equals the original beads directory,
-// this indicates an errant redirect file that should be removed. The function logs a
-// warning and returns the original beads directory.
+// ResolveBeadsDir is the compatibility form of ResolveBeadsDirStrict. New CLI
+// execution paths that can return an error should use ResolveBeadsDirStrict so
+// an invalid redirect fails closed instead of falling back to redirect-local
+// metadata. Resolution never edits either the redirect or its neighboring files.
 func ResolveBeadsDir(workDir string) string {
-	if filepath.Base(workDir) == ".beads" {
-		workDir = filepath.Dir(workDir)
+	resolved, err := ResolveBeadsDirStrict(workDir)
+	if err == nil {
+		return resolved
 	}
-	beadsDir := filepath.Join(workDir, ".beads")
-	redirectPath := filepath.Join(beadsDir, "redirect")
-
-	// Check for redirect file
-	data, err := os.ReadFile(redirectPath) //nolint:gosec // G304: path is constructed internally
-	if err != nil {
-		// No redirect, use local .beads
-		return beadsDir
-	}
-
-	// Read and clean the redirect path
-	redirectTarget := strings.TrimSpace(string(data))
-	if redirectTarget == "" {
-		return beadsDir
-	}
-
-	// Resolve redirect target. Absolute paths are used as-is;
-	// relative paths are resolved from workDir.
-	var resolved string
-	if filepath.IsAbs(redirectTarget) {
-		resolved = filepath.Clean(redirectTarget)
-	} else {
-		resolved = filepath.Clean(filepath.Join(workDir, redirectTarget))
-	}
-
-	// Detect circular redirects: if resolved path equals original beads dir,
-	// this is an errant redirect file (e.g., redirect in mayor/rig/.beads pointing to itself)
-	if resolved == beadsDir {
-		fmt.Fprintf(os.Stderr, "Warning: circular redirect detected in %s (points to itself), ignoring redirect\n", redirectPath)
-		// Remove the errant redirect file to prevent future warnings
-		if err := os.Remove(redirectPath); err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: could not remove errant redirect file: %v\n", err)
-		}
-		return beadsDir
-	}
-
-	// Follow redirect chains (e.g., crew/.beads -> rig/.beads -> mayor/rig/.beads)
-	// This is intentional for the rig-level redirect architecture.
-	// Limit depth to prevent infinite loops from misconfigured redirects.
-	return resolveBeadsDirWithDepth(resolved, 3)
+	fmt.Fprintf(os.Stderr, "Warning: %v\n", err)
+	return localBeadsDir(workDir)
 }
 
-// resolveBeadsDirWithDepth follows redirect chains with a depth limit.
+// ResolveBeadsDirStrict returns the canonical beads directory after following
+// redirects. A redirect is authoritative even when metadata.json or config.yaml
+// next to it names another project: only the final target's identity is used.
+//
+// Invalid, missing, circular, and over-deep targets return a custody-safe error.
+// Callers must not silently retry against the redirect-local directory.
+func ResolveBeadsDirStrict(workDir string) (string, error) {
+	return resolveBeadsDirStrictWithDepth(workDir, maxBeadsRedirectDepth)
+}
+
+func resolveBeadsDirStrictWithDepth(workDir string, maxDepth int) (string, error) {
+	beadsDir := localBeadsDir(workDir)
+	current := beadsDir
+	seen := make(map[string]struct{}, maxDepth+1)
+
+	for depth := 0; ; depth++ {
+		if _, ok := seen[current]; ok {
+			return "", redirectResolutionError(filepath.Join(current, "redirect"), current, "redirect cycle detected")
+		}
+		seen[current] = struct{}{}
+
+		redirectPath := filepath.Join(current, "redirect")
+		data, err := os.ReadFile(redirectPath) //nolint:gosec // G304: path is constructed internally
+		if os.IsNotExist(err) {
+			if depth > 0 {
+				info, statErr := os.Stat(current)
+				if statErr != nil {
+					return "", redirectResolutionError(redirectPath, current, fmt.Sprintf("target is unavailable: %v", statErr))
+				}
+				if !info.IsDir() {
+					return "", redirectResolutionError(redirectPath, current, "target is not a directory")
+				}
+			}
+			return current, nil
+		}
+		if err != nil {
+			return "", redirectResolutionError(redirectPath, current, fmt.Sprintf("cannot read redirect: %v", err))
+		}
+
+		target := strings.TrimSpace(string(data))
+		if target == "" {
+			return "", redirectResolutionError(redirectPath, "", "redirect target is empty")
+		}
+		var resolvedTarget string
+		if filepath.IsAbs(target) {
+			resolvedTarget = filepath.Clean(target)
+		} else {
+			resolvedTarget = filepath.Clean(filepath.Join(filepath.Dir(current), target))
+		}
+		if depth >= maxDepth {
+			return "", redirectResolutionError(redirectPath, resolvedTarget, fmt.Sprintf("redirect chain exceeds %d hops", maxDepth))
+		}
+		current = resolvedTarget
+	}
+}
+
+func localBeadsDir(workDir string) string {
+	if filepath.Base(workDir) == ".beads" {
+		return filepath.Clean(workDir)
+	}
+	return filepath.Clean(filepath.Join(workDir, ".beads"))
+}
+
+func redirectResolutionError(redirectPath, target, reason string) error {
+	remediation := "preserve existing .beads files; do not run bd init, edit/delete metadata, or use gt doctor --fix"
+	if target != "" {
+		remediation = fmt.Sprintf("verify %s read-only, then retry with BEADS_DIR=%s; %s", target, target, remediation)
+	} else {
+		remediation = "set BEADS_DIR to the verified canonical .beads directory and retry; " + remediation
+	}
+	return fmt.Errorf("%w at %s: %s; safe remediation: %s", ErrBeadsRedirectResolution, redirectPath, reason, remediation)
+}
+
+// resolveBeadsDirWithDepth is retained for package-local compatibility tests.
+// It is read-only and delegates to the strict resolver.
 func resolveBeadsDirWithDepth(beadsDir string, maxDepth int) string {
 	if maxDepth <= 0 {
 		fmt.Fprintf(os.Stderr, "Warning: redirect chain too deep at %s, stopping\n", beadsDir)
 		return beadsDir
 	}
-
-	redirectPath := filepath.Join(beadsDir, "redirect")
-	data, err := os.ReadFile(redirectPath) //nolint:gosec // G304: path is constructed internally
+	resolved, err := resolveBeadsDirStrictWithDepth(beadsDir, maxDepth)
 	if err != nil {
-		// No redirect, this is the final destination
+		fmt.Fprintf(os.Stderr, "Warning: %v\n", err)
 		return beadsDir
 	}
-
-	redirectTarget := strings.TrimSpace(string(data))
-	if redirectTarget == "" {
-		return beadsDir
-	}
-
-	// Resolve redirect target. Absolute paths are used as-is;
-	// relative paths are resolved from parent of beadsDir.
-	workDir := filepath.Dir(beadsDir)
-	var resolved string
-	if filepath.IsAbs(redirectTarget) {
-		resolved = filepath.Clean(redirectTarget)
-	} else {
-		resolved = filepath.Clean(filepath.Join(workDir, redirectTarget))
-	}
-
-	// Detect circular redirect
-	if resolved == beadsDir {
-		fmt.Fprintf(os.Stderr, "Warning: circular redirect detected in %s, stopping\n", redirectPath)
-		return beadsDir
-	}
-
-	// Recursively follow
-	return resolveBeadsDirWithDepth(resolved, maxDepth-1)
+	return resolved
 }
 
 // cleanBeadsRuntimeFiles removes redirect-local runtime and identity files from a
