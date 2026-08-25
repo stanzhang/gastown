@@ -241,6 +241,9 @@ func TestEnsureRefineryRunningForkRigDoesNotSpawn(t *testing.T) {
 		config: DefaultConfig(townRoot),
 		logger: log.New(&logBuf, "", 0),
 		tmux:   tmux.NewTmux(),
+		rigBeadLabelsLookup: func(_, _ string) ([]string, error) {
+			return nil, nil
+		},
 	}
 	d.ensureRefineryRunning("testrig")
 
