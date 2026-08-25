@@ -2,7 +2,6 @@ package cmd
 
 import (
 	"fmt"
-	"os"
 
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/gastown/internal/constants"
@@ -54,7 +53,7 @@ func runPatrolNew(cmd *cobra.Command, args []string) error {
 			RoleName:      "deacon",
 			PatrolMolName: constants.MolDeaconPatrol,
 			BeadsDir:      roleInfo.TownRoot,
-			Assignee:      "deacon",
+			Assignee:      "deacon/",
 		}
 	case RoleWitness:
 		cfg = PatrolConfig{
@@ -78,12 +77,6 @@ func runPatrolNew(cmd *cobra.Command, args []string) error {
 	// Create and hook the wisp
 	patrolID, err := autoSpawnPatrol(cfg)
 	if err != nil {
-		if patrolID != "" {
-			// Created but failed to hook
-			fmt.Fprintf(os.Stderr, "warning: %s\n", err.Error())
-			fmt.Println(patrolID)
-			return nil
-		}
 		return err
 	}
 
