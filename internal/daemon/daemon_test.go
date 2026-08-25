@@ -2,7 +2,9 @@ package daemon
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log"
 	"os"
@@ -15,6 +17,8 @@ import (
 	"time"
 
 	"github.com/gofrs/flock"
+	beadsdk "github.com/steveyegge/beads"
+	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/tmux"
 )
 
@@ -50,6 +54,37 @@ func TestDaemonPathCandidatesIncludesLaunchdToolDirs(t *testing.T) {
 	} {
 		if !slices.Contains(got, want) {
 			t.Fatalf("daemonPathCandidates(%q, %q) missing %q; got %v", home, exePath, want, got)
+		}
+	}
+}
+
+func TestAugmentDaemonPathMakesUserToolsAvailable(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("PATH lookup expectations are POSIX-specific")
+	}
+
+	home := t.TempDir()
+	localBin := filepath.Join(home, ".local", "bin")
+	if err := os.MkdirAll(localBin, 0o755); err != nil {
+		t.Fatalf("mkdir local bin: %v", err)
+	}
+	for _, name := range []string{"bd", "tmux"} {
+		if err := os.WriteFile(filepath.Join(localBin, name), []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+			t.Fatalf("write fake %s: %v", name, err)
+		}
+	}
+
+	t.Setenv("HOME", home)
+	t.Setenv("PATH", "/usr/bin:/bin")
+	augmentDaemonPath(log.New(io.Discard, "", 0))
+
+	for _, name := range []string{"bd", "tmux"} {
+		got, err := exec.LookPath(name)
+		if err != nil {
+			t.Fatalf("%s unavailable after early PATH augmentation: %v", name, err)
+		}
+		if got != filepath.Join(localBin, name) {
+			t.Fatalf("%s resolved to %q, want %q", name, got, filepath.Join(localBin, name))
 		}
 	}
 }
@@ -882,12 +917,11 @@ func TestHasPendingEvents_IgnoresNonEventFiles(t *testing.T) {
 	}
 }
 
-// TestIsRigOperational_FailSafeOnDoltUnavailable verifies that when Dolt is
-// unavailable and we can't check the rig bead for docked status, we fail-safe
-// by assuming the rig is NOT operational. This prevents wasting API credits
-// starting witnesses for potentially docked rigs. (Regression test for
-// bug where witnesses started for docked rigs during Dolt outage)
-func TestIsRigOperational_FailSafeOnDoltUnavailable(t *testing.T) {
+// TestIsRigOperational_FailSafeOnBeadsConnectionUnavailable verifies that a
+// confirmed store/connection outage fails closed rather than starting patrols
+// for a potentially docked rig. Ambiguous timeouts have a separate degrade-open
+// policy below.
+func TestIsRigOperational_FailSafeOnBeadsConnectionUnavailable(t *testing.T) {
 	tmpDir := t.TempDir()
 
 	// Create a minimal rig structure without a beads database
@@ -929,8 +963,7 @@ func TestIsRigOperational_FailSafeOnDoltUnavailable(t *testing.T) {
 		logger: log.New(io.Discard, "", 0), // Suppress log output
 	}
 
-	// When Dolt is unavailable, isRigOperational should return false
-	// (fail-safe: assume not operational rather than risk starting docked rig)
+	// With no open rig store, the confirmed beads connection failure fails closed.
 	operational, reason := d.isRigOperational(rigName)
 	if operational {
 		t.Error("isRigOperational should return false when Dolt is unavailable (fail-safe)")
@@ -938,8 +971,8 @@ func TestIsRigOperational_FailSafeOnDoltUnavailable(t *testing.T) {
 	if reason == "" {
 		t.Error("isRigOperational should provide a reason when returning false")
 	}
-	if !strings.Contains(reason, "Dolt unavailable") && !strings.Contains(reason, "cannot verify") {
-		t.Errorf("reason should mention Dolt unavailable, got: %q", reason)
+	if !strings.Contains(reason, "beads connection unavailable") {
+		t.Errorf("reason should identify the beads connection failure, got: %q", reason)
 	}
 }
 
@@ -985,4 +1018,87 @@ func TestIsRigOperational_DockedRig(t *testing.T) {
 		t.Error("isRigOperational should return false when rig bead is missing")
 	}
 	t.Logf("Docked rig check returned: operational=%v, reason=%q", operational, reason)
+}
+
+func TestIsRigOperationalLookupFailurePolicy(t *testing.T) {
+	tests := []struct {
+		name            string
+		err             error
+		wantOperational bool
+		wantLog         string
+	}{
+		{name: "timeout degrades and retries next heartbeat", err: context.DeadlineExceeded, wantOperational: true, wantLog: "lookup timed out"},
+		{name: "connection failure fails closed", err: errors.New("dial tcp 127.0.0.1:3307: connection refused"), wantOperational: false, wantLog: "beads connection"},
+		{name: "missing rig bead means no global override", err: beads.ErrNotFound, wantOperational: true, wantLog: "not found"},
+		{name: "unknown failure preserves oversight", err: errors.New("subprocess exited unexpectedly"), wantOperational: true, wantLog: "failed unexpectedly"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			townRoot := t.TempDir()
+			rigName := "testrig"
+			rigPath := filepath.Join(townRoot, rigName)
+			if err := os.MkdirAll(rigPath, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(rigPath, "config.json"), []byte(`{"beads":{"prefix":"tr"}}`), 0o644); err != nil {
+				t.Fatal(err)
+			}
+
+			var logs bytes.Buffer
+			d := &Daemon{
+				config: DefaultConfig(townRoot),
+				logger: log.New(&logs, "", 0),
+				rigBeadLabelsLookup: func(_, _ string) ([]string, error) {
+					return nil, tt.err
+				},
+			}
+
+			operational, reason := d.isRigOperational(rigName)
+			if operational != tt.wantOperational {
+				t.Fatalf("isRigOperational() = %v (%q), want %v", operational, reason, tt.wantOperational)
+			}
+			if !strings.Contains(logs.String(), tt.wantLog) {
+				t.Fatalf("log = %q, want %q", logs.String(), tt.wantLog)
+			}
+		})
+	}
+}
+
+type rigStatusStore struct {
+	beadsdk.Storage
+	issue *beadsdk.Issue
+	calls int
+}
+
+func (s *rigStatusStore) GetIssue(_ context.Context, _ string) (*beadsdk.Issue, error) {
+	s.calls++
+	return s.issue, nil
+}
+
+func TestIsRigOperationalUsesOpenStore(t *testing.T) {
+	townRoot := t.TempDir()
+	rigName := "testrig"
+	rigPath := filepath.Join(townRoot, rigName)
+	if err := os.MkdirAll(rigPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(rigPath, "config.json"), []byte(`{"beads":{"prefix":"tr"}}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	store := &rigStatusStore{issue: &beadsdk.Issue{ID: "tr-rig-testrig", Labels: []string{"status:docked"}}}
+	d := &Daemon{
+		config:      DefaultConfig(townRoot),
+		logger:      log.New(io.Discard, "", 0),
+		ctx:         context.Background(),
+		beadsStores: map[string]beadsdk.Storage{rigName: store},
+	}
+	operational, reason := d.isRigOperational(rigName)
+	if operational || reason != "rig is docked (global)" {
+		t.Fatalf("isRigOperational() = %v, %q; want globally docked", operational, reason)
+	}
+	if store.calls != 1 {
+		t.Fatalf("store GetIssue calls = %d, want 1", store.calls)
+	}
 }

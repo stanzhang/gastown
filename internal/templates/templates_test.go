@@ -20,6 +20,22 @@ func TestNew(t *testing.T) {
 	}
 }
 
+func TestTownRootDoltDiagnosticsUseCanonicalPIDPath(t *testing.T) {
+	content := TownRootCLAUDEmd()
+	if strings.Contains(content, ".dolt-data/dolt.pid") {
+		t.Fatal("town-root diagnostics still reference the stale Dolt PID path")
+	}
+	if !strings.Contains(content, "$GT_TOWN_ROOT/daemon/dolt.pid") {
+		t.Fatal("town-root diagnostics missing canonical daemon/dolt.pid path")
+	}
+	if !strings.Contains(content, "fails loudly") || !strings.Contains(content, "dolt dump") {
+		t.Fatal("town-root diagnostics must use the validated, loud-failure dump command")
+	}
+	if got := strings.Count(content, "### If you detect Dolt trouble"); got != 1 {
+		t.Fatalf("Dolt trouble section count = %d, want 1", got)
+	}
+}
+
 func TestRenderRole_Mayor(t *testing.T) {
 	tmpl, err := New()
 	if err != nil {

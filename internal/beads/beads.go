@@ -785,7 +785,8 @@ func (b *Beads) runWithStdin(stdinData []byte, args ...string) (_ []byte, retErr
 	// Bound the subprocess runtime so a slow Dolt response doesn't leave bd
 	// blocking forever (under memory pressure that invites Jetsam SIGKILL).
 	// The context covers both the initial attempt and the --flat retry.
-	ctx, cancel := context.WithTimeout(context.Background(), resolveBdSubprocessTimeout())
+	timeout := resolveBdSubprocessTimeout()
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
 	// Always explicitly set BEADS_DIR to prevent inherited env vars from
@@ -832,7 +833,7 @@ func (b *Beads) runWithStdin(stdinData []byte, args ...string) (_ []byte, retErr
 	}
 
 	if err != nil {
-		return nil, b.wrapError(err, stderr.String(), args)
+		return nil, b.wrapSubprocessError(ctx, timeout, err, stderr.String(), args)
 	}
 
 	// Handle bd exit code 0 bug: when issue not found,
@@ -860,7 +861,8 @@ func (b *Beads) runWithRouting(args ...string) (_ []byte, retErr error) { //noli
 	fullArgs := MaybePrependAllowStaleWithEnv(runEnv, args)
 
 	// Bound subprocess runtime — see bdSubprocessTimeout doc comment.
-	ctx, cancel := context.WithTimeout(context.Background(), resolveBdSubprocessTimeout())
+	timeout := resolveBdSubprocessTimeout()
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, "bd", fullArgs...) //nolint:gosec // G204: bd is a trusted internal tool
@@ -875,7 +877,7 @@ func (b *Beads) runWithRouting(args ...string) (_ []byte, retErr error) { //noli
 
 	err := cmd.Run()
 	if err != nil {
-		return nil, b.wrapError(err, stderr.String(), args)
+		return nil, b.wrapSubprocessError(ctx, timeout, err, stderr.String(), args)
 	}
 
 	if stdout.Len() == 0 && stderr.Len() > 0 {
@@ -915,6 +917,16 @@ func (b *Beads) wrapError(err error, stderr string, args []string) error {
 		return fmt.Errorf("bd %s: %s", strings.Join(args, " "), stderr)
 	}
 	return fmt.Errorf("bd %s: %w", strings.Join(args, " "), err)
+}
+
+// wrapSubprocessError preserves deadline identity before os/exec flattens a
+// CommandContext timeout into an opaque "signal: killed" error. Callers can
+// then distinguish host/process starvation from a Dolt connection failure.
+func (b *Beads) wrapSubprocessError(ctx context.Context, timeout time.Duration, err error, stderr string, args []string) error {
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		return fmt.Errorf("bd %s timed out after %s: %w", strings.Join(args, " "), timeout, context.DeadlineExceeded)
+	}
+	return b.wrapError(err, stderr, args)
 }
 
 // isSubprocessCrash returns true if the error indicates the subprocess crashed
