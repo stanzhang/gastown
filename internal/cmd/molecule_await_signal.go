@@ -136,7 +136,8 @@ func init() {
 }
 
 func runMoleculeAwaitSignal(cmd *cobra.Command, args []string) error {
-	// Find beads directory (rig-local for bead operations)
+	// Find the town-level agent registry. Work beads remain rig-local; only
+	// operational state for the supplied agent bead is read or updated here.
 	beadsDir, err := resolveAgentTrackingBeadsDir()
 	if err != nil {
 		return fmt.Errorf("not in a beads workspace: %w", err)
@@ -154,21 +155,16 @@ func runMoleculeAwaitSignal(cmd *cobra.Command, args []string) error {
 	if awaitSignalAgentBead != "" {
 		labels, err := getAgentLabels(awaitSignalAgentBead, beadsDir)
 		if err != nil {
-			// Agent bead might not exist yet - that's OK, start at 0
-			if !awaitSignalQuiet {
-				fmt.Printf("%s Could not read agent bead (starting at idle=0): %v\n",
-					style.Dim.Render("⚠"), err)
+			return fmt.Errorf("registering await-signal for agent bead %q: %w", awaitSignalAgentBead, err)
+		}
+		if idleStr, ok := labels["idle"]; ok {
+			if n, err := parseIntSimple(idleStr); err == nil {
+				idleCycles = n
 			}
-		} else {
-			if idleStr, ok := labels["idle"]; ok {
-				if n, err := parseIntSimple(idleStr); err == nil {
-					idleCycles = n
-				}
-			}
-			if untilStr, ok := labels["backoff-until"]; ok {
-				if ts, err := parseIntSimple(untilStr); err == nil && ts > 0 {
-					backoffUntil = time.Unix(int64(ts), 0)
-				}
+		}
+		if untilStr, ok := labels["backoff-until"]; ok {
+			if ts, err := parseIntSimple(untilStr); err == nil && ts > 0 {
+				backoffUntil = time.Unix(int64(ts), 0)
 			}
 		}
 	}

@@ -8,63 +8,56 @@ import (
 	"testing"
 )
 
-func TestResolveAgentTrackingBeadsDirUsesTownFromTownAndRigCwd(t *testing.T) {
+func TestResolveAgentTrackingBeadsDirUsesTownRegistryAcrossPatrolContexts(t *testing.T) {
 	tmp, _ := filepath.EvalSymlinks(t.TempDir())
 	townRoot := filepath.Join(tmp, "gt")
 	townBeads := filepath.Join(townRoot, ".beads")
-	rigWorkDir := filepath.Join(townRoot, "gastown", "refinery", "rig")
-	rigRedirect := filepath.Join(rigWorkDir, ".beads")
-	rigBeads := filepath.Join(townRoot, "gastown", "mayor", "rig", ".beads")
+	rigRoot := filepath.Join(townRoot, "gastown")
+	witnessDir := filepath.Join(rigRoot, "witness")
+	refineryDir := filepath.Join(rigRoot, "refinery", "rig")
+	rigBeads := filepath.Join(rigRoot, ".beads")
 
-	for _, dir := range []string{filepath.Join(townRoot, "mayor"), townBeads, rigRedirect, rigBeads} {
+	for _, dir := range []string{filepath.Join(townRoot, "mayor"), townBeads, witnessDir, refineryDir, rigBeads} {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			t.Fatalf("mkdir %s: %v", dir, err)
 		}
 	}
-	if err := os.WriteFile(filepath.Join(rigRedirect, "redirect"), []byte("../../mayor/rig/.beads"), 0o644); err != nil {
-		t.Fatalf("write rig redirect: %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(townRoot, "mayor", "town.json"), []byte(`{"name":"test"}`), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(townRoot, "mayor", "town.json"), []byte(`{}`), 0o644); err != nil {
 		t.Fatalf("write town marker: %v", err)
 	}
-	t.Setenv("BEADS_DIR", townBeads)
+	townBeadsCanonical, err := filepath.EvalSymlinks(townBeads)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	oldWd, err := os.Getwd()
 	if err != nil {
 		t.Fatalf("getwd: %v", err)
 	}
 	defer func() { _ = os.Chdir(oldWd) }()
-	if err := os.Chdir(rigWorkDir); err != nil {
-		t.Fatalf("chdir rig work dir: %v", err)
-	}
 
-	gotWorkDir, err := findCwdBeadsWorkDir()
-	if err != nil {
-		t.Fatalf("findCwdBeadsWorkDir() error = %v", err)
-	}
-	if gotWorkDir != rigWorkDir {
-		t.Fatalf("findCwdBeadsWorkDir() = %q, want %q", gotWorkDir, rigWorkDir)
-	}
-
-	for _, cwd := range []string{rigWorkDir, townRoot} {
-		if err := os.Chdir(cwd); err != nil {
-			t.Fatalf("chdir %s: %v", cwd, err)
-		}
-		gotBeadsDir, err := resolveAgentTrackingBeadsDir()
-		if err != nil {
-			t.Fatalf("resolveAgentTrackingBeadsDir() from %s error = %v", cwd, err)
-		}
-		if gotBeadsDir != townBeads {
-			t.Fatalf("resolveAgentTrackingBeadsDir() from %s = %q, want town %q", cwd, gotBeadsDir, townBeads)
-		}
-	}
-
-	gotLocalWorkDir, err := findLocalBeadsDir()
-	if err != nil {
-		t.Fatalf("findLocalBeadsDir() error = %v", err)
-	}
-	if gotLocalWorkDir != townRoot {
-		t.Fatalf("findLocalBeadsDir() = %q, want env parent %q", gotLocalWorkDir, townRoot)
+	for name, cwd := range map[string]string{
+		"town":     townRoot,
+		"rig root": rigRoot,
+		"witness":  witnessDir,
+		"refinery": refineryDir,
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := os.Chdir(cwd); err != nil {
+				t.Fatalf("chdir %s: %v", cwd, err)
+			}
+			got, err := resolveAgentTrackingBeadsDir()
+			if err != nil {
+				t.Fatalf("resolveAgentTrackingBeadsDir() error = %v", err)
+			}
+			gotCanonical, err := filepath.EvalSymlinks(got)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if gotCanonical != townBeadsCanonical {
+				t.Fatalf("resolveAgentTrackingBeadsDir() = %q, want town registry %q", got, townBeads)
+			}
+		})
 	}
 }
 
@@ -84,6 +77,9 @@ func TestRunAgentStateUsesTownBeadsDirFromTownAndRigCwd(t *testing.T) {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			t.Fatalf("mkdir %s: %v", dir, err)
 		}
+	}
+	if err := os.WriteFile(filepath.Join(townRoot, "mayor", "town.json"), []byte(`{}`), 0o644); err != nil {
+		t.Fatalf("write town marker: %v", err)
 	}
 	if err := os.WriteFile(filepath.Join(rigRedirect, "redirect"), []byte("../../mayor/rig/.beads"), 0o644); err != nil {
 		t.Fatalf("write rig redirect: %v", err)
@@ -166,15 +162,19 @@ esac
 		t.Fatal("fake bd was not invoked")
 	}
 
+	townBeadsCanonical, err := filepath.EvalSymlinks(townBeads)
+	if err != nil {
+		t.Fatal(err)
+	}
 	for _, line := range strings.Split(log, "\n") {
-		if !strings.Contains(line, "BEADS_DIR="+townBeads) {
-			t.Fatalf("bd call was not pinned to town beads %q: %s\nfull log:\n%s", townBeads, line, log)
+		if !strings.Contains(line, "BEADS_DIR="+townBeadsCanonical) {
+			t.Fatalf("bd call was not pinned to town registry %q: %s\nfull log:\n%s", townBeads, line, log)
 		}
 		if strings.Contains(line, "BEADS_DIR="+rigBeads) {
-			t.Fatalf("bd call used rig BEADS_DIR %q: %s\nfull log:\n%s", rigBeads, line, log)
+			t.Fatalf("bd call used rig work database %q: %s\nfull log:\n%s", rigBeads, line, log)
 		}
 		if !strings.Contains(line, "DB=town") || strings.Contains(line, "DB=rigdb") {
-			t.Fatalf("bd call was not pinned to town database: %s\nfull log:\n%s", line, log)
+			t.Fatalf("bd call was not pinned to town registry database: %s\nfull log:\n%s", line, log)
 		}
 		if strings.Contains(line, "cmd=show") {
 			if !strings.Contains(line, "READONLY=true") || !strings.Contains(line, "AUTO=off") {

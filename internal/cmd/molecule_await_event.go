@@ -161,24 +161,21 @@ func runMoleculeAwaitEvent(cmd *cobra.Command, args []string) error {
 	if awaitEventAgentBead != "" {
 		var wdErr error
 		beadsDir, wdErr = resolveAgentTrackingBeadsDir()
-		if wdErr == nil {
-			labels, labErr := getAgentLabels(awaitEventAgentBead, beadsDir)
-			if labErr != nil {
-				if !awaitEventQuiet {
-					fmt.Printf("%s Could not read agent bead (starting at idle=0): %v\n",
-						style.Dim.Render("⚠"), labErr)
-				}
-			} else {
-				if idleStr, ok := labels["idle"]; ok {
-					if n, parseErr := parseIntSimple(idleStr); parseErr == nil {
-						idleCycles = n
-					}
-				}
-				if untilStr, ok := labels["backoff-until"]; ok {
-					if ts, parseErr := parseIntSimple(untilStr); parseErr == nil && ts > 0 {
-						backoffUntil = time.Unix(int64(ts), 0)
-					}
-				}
+		if wdErr != nil {
+			return fmt.Errorf("resolving agent registry: %w", wdErr)
+		}
+		labels, labErr := getAgentLabels(awaitEventAgentBead, beadsDir)
+		if labErr != nil {
+			return fmt.Errorf("registering await-event for agent bead %q: %w", awaitEventAgentBead, labErr)
+		}
+		if idleStr, ok := labels["idle"]; ok {
+			if n, parseErr := parseIntSimple(idleStr); parseErr == nil {
+				idleCycles = n
+			}
+		}
+		if untilStr, ok := labels["backoff-until"]; ok {
+			if ts, parseErr := parseIntSimple(untilStr); parseErr == nil && ts > 0 {
+				backoffUntil = time.Unix(int64(ts), 0)
 			}
 		}
 	}

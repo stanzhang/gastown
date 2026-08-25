@@ -587,18 +587,22 @@ esac
 		t.Fatal("fake bd was not invoked")
 	}
 
+	townBeadsCanonical, err := filepath.EvalSymlinks(townBeads)
+	if err != nil {
+		t.Fatal(err)
+	}
 	for _, line := range strings.Split(log, "\n") {
-		if !strings.Contains(line, "BEADS_DIR="+townBeads) {
-			t.Fatalf("bd call was not pinned to town beads %q: %s\nfull log:\n%s", townBeads, line, log)
+		if !strings.Contains(line, "BEADS_DIR="+townBeadsCanonical) {
+			t.Fatalf("bd call was not pinned to town registry %q: %s\nfull log:\n%s", townBeads, line, log)
 		}
 		if strings.Contains(line, "BEADS_DIR="+rigBeads) {
-			t.Fatalf("bd call used rig BEADS_DIR %q: %s\nfull log:\n%s", rigBeads, line, log)
+			t.Fatalf("bd call used rig work database %q: %s\nfull log:\n%s", rigBeads, line, log)
 		}
 		if !strings.Contains(line, "DB=town") {
-			t.Fatalf("bd call was not pinned to town database: %s\nfull log:\n%s", line, log)
+			t.Fatalf("bd call was not pinned to town registry database: %s\nfull log:\n%s", line, log)
 		}
 		if strings.Contains(line, "DB=rigdb") {
-			t.Fatalf("bd call used rig database: %s\nfull log:\n%s", line, log)
+			t.Fatalf("bd call used rig work database: %s\nfull log:\n%s", line, log)
 		}
 		if strings.Contains(line, "cmd=show") {
 			if !strings.Contains(line, "READONLY=true") || !strings.Contains(line, "AUTO=off") {

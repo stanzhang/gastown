@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -551,6 +552,65 @@ func TestAwaitEventTimeoutClearsBackoffWindow(t *testing.T) {
 	last := updates[len(updates)-1]
 	if strings.Contains(last, "backoff-until:") {
 		t.Fatalf("timeout did not clear backoff window; last update %q in log:\n%s", last, log)
+	}
+}
+
+func TestAwaitEventRejectsMissingAgentBeadBeforeWaiting(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("uses a POSIX shell fake bd")
+	}
+
+	townRoot := filepath.Join(t.TempDir(), "gt")
+	refineryDir := filepath.Join(townRoot, "queen_annes_revenge", "refinery", "rig")
+	for _, dir := range []string{filepath.Join(townRoot, "mayor"), filepath.Join(townRoot, ".beads"), refineryDir} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(townRoot, "mayor", "town.json"), []byte(`{}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	binDir := filepath.Join(townRoot, "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	script := `#!/bin/sh
+if [ "$1" = "show" ]; then
+  printf 'issue not found\n' >&2
+  exit 1
+fi
+printf 'unexpected mutation: %s\n' "$1" >&2
+exit 1
+`
+	if err := os.WriteFile(filepath.Join(binDir, "bd"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Chdir(refineryDir)
+
+	oldChannel := awaitEventChannel
+	oldTimeout := awaitEventTimeout
+	oldAgentBead := awaitEventAgentBead
+	oldQuiet := awaitEventQuiet
+	t.Cleanup(func() {
+		awaitEventChannel = oldChannel
+		awaitEventTimeout = oldTimeout
+		awaitEventAgentBead = oldAgentBead
+		awaitEventQuiet = oldQuiet
+	})
+	awaitEventChannel = "refinery"
+	awaitEventTimeout = "10s"
+	awaitEventAgentBead = "qar-invented-refinery"
+	awaitEventQuiet = true
+
+	started := time.Now()
+	err := runMoleculeAwaitEvent(nil, nil)
+	if err == nil || !strings.Contains(err.Error(), "registering await-event") || !strings.Contains(err.Error(), "agent bead not found") {
+		t.Fatalf("runMoleculeAwaitEvent() error = %v, want explicit missing-agent registration error", err)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("await-event waited %v despite missing agent bead", elapsed)
 	}
 }
 

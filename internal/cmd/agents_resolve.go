@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -25,9 +26,10 @@ var agentsResolveCmd = &cobra.Command{
 	Long: `Resolve the active agent bead for a role.
 
 Agent identity beads are town-owned even when their IDs carry a rig prefix.
-The resolver searches the town database across durable issues and ephemeral
-wisps, falling back to a local database only outside a Gas Town workspace.
-Closed beads are ignored.`,
+The resolver searches the authoritative town registry across durable issues
+and ephemeral wisps, returning the same record from town, rig root, witness,
+and refinery working directories. It falls back to the local database only
+outside a Gas Town workspace. Closed beads are ignored.`,
 	RunE: runAgentsResolve,
 }
 
@@ -63,6 +65,44 @@ type agentsResolveResult struct {
 	Status   string `json:"status"`
 }
 
+type agentBeadResolveErrorKind string
+
+const (
+	agentBeadNotFound  agentBeadResolveErrorKind = "agent_bead_not_found"
+	agentBeadAmbiguous agentBeadResolveErrorKind = "agent_bead_ambiguous"
+)
+
+// agentBeadResolveError is returned when the town agent registry cannot yield
+// exactly one active bead for a role. Callers can use errors.As instead of
+// parsing diagnostics, while --json exposes Kind as error_type.
+type agentBeadResolveError struct {
+	Kind       agentBeadResolveErrorKind
+	Role       string
+	Rig        string
+	Candidates []string
+}
+
+func (e *agentBeadResolveError) Error() string {
+	switch e.Kind {
+	case agentBeadAmbiguous:
+		return fmt.Sprintf("multiple matching agent beads found for role %q in rig %q: %s", e.Role, e.Rig, strings.Join(e.Candidates, ", "))
+	default:
+		message := fmt.Sprintf("no agent bead found for role %q", e.Role)
+		if e.Rig != "" {
+			message += fmt.Sprintf(" in rig %q", e.Rig)
+		}
+		return message
+	}
+}
+
+type agentsResolveErrorResult struct {
+	Error      string   `json:"error"`
+	ErrorType  string   `json:"error_type"`
+	Role       string   `json:"role"`
+	Rig        string   `json:"rig,omitempty"`
+	Candidates []string `json:"candidates,omitempty"`
+}
+
 func runAgentsResolve(cmd *cobra.Command, _ []string) error {
 	role := strings.TrimSpace(agentsResolveRole)
 	rig := strings.TrimSpace(agentsResolveRig)
@@ -70,16 +110,16 @@ func runAgentsResolve(cmd *cobra.Command, _ []string) error {
 		return fmt.Errorf("--role is required")
 	}
 
+	registryBeadsDir, err := resolveAgentTrackingBeadsDir()
+	if err != nil {
+		return err
+	}
 	cwd, err := os.Getwd()
 	if err != nil {
 		return fmt.Errorf("getting working directory: %w", err)
 	}
-	currentBeadsDir, err := resolveAgentTrackingBeadsDir()
-	if err != nil {
-		return err
-	}
 
-	candidates, err := findAgentBeadCandidates(cwd, currentBeadsDir)
+	candidates, err := findAgentBeadCandidates(cwd, registryBeadsDir)
 	if err != nil {
 		return err
 	}
@@ -93,22 +133,17 @@ func runAgentsResolve(cmd *cobra.Command, _ []string) error {
 
 	match, err := pickBestAgentBead(matches)
 	if err != nil {
-		return err
+		var resolveErr *agentBeadResolveError
+		if errors.As(err, &resolveErr) {
+			resolveErr.Role = role
+			resolveErr.Rig = rig
+		}
+		return outputAgentBeadResolveError(cmd, err)
 	}
 	if match == nil {
-		message := fmt.Sprintf("no agent bead found for role %q", role)
-		if rig != "" {
-			message += fmt.Sprintf(" in rig %q", rig)
-		}
-		if agentsResolveJSON {
-			_ = json.NewEncoder(cmd.OutOrStdout()).Encode(map[string]string{"error": message})
-			return NewSilentExit(1)
-		}
-		if agentsResolveQuiet {
-			return NewSilentExit(1)
-		}
-		return fmt.Errorf("%s", message)
+		return outputAgentBeadResolveError(cmd, &agentBeadResolveError{Kind: agentBeadNotFound, Role: role, Rig: rig})
 	}
+
 	if agentsResolveJSON {
 		return json.NewEncoder(cmd.OutOrStdout()).Encode(agentsResolveResult{
 			ID:       match.ID,
@@ -122,12 +157,30 @@ func runAgentsResolve(cmd *cobra.Command, _ []string) error {
 	return nil
 }
 
-func findAgentBeadCandidates(cwd, currentBeadsDir string) ([]agentBeadCandidate, error) {
+func outputAgentBeadResolveError(cmd *cobra.Command, err error) error {
+	var resolveErr *agentBeadResolveError
+	if agentsResolveJSON && errors.As(err, &resolveErr) {
+		_ = json.NewEncoder(cmd.OutOrStdout()).Encode(agentsResolveErrorResult{
+			Error:      resolveErr.Error(),
+			ErrorType:  string(resolveErr.Kind),
+			Role:       resolveErr.Role,
+			Rig:        resolveErr.Rig,
+			Candidates: resolveErr.Candidates,
+		})
+		return NewSilentExit(1)
+	}
+	if agentsResolveQuiet && errors.As(err, &resolveErr) && resolveErr.Kind == agentBeadNotFound {
+		return NewSilentExit(1)
+	}
+	return err
+}
+
+func findAgentBeadCandidates(cwd, registryBeadsDir string) ([]agentBeadCandidate, error) {
 	issueSource, wispSource := agentSourceTownIssues, agentSourceTownWisps
 	if beads.FindTownRoot(cwd) == "" {
 		issueSource, wispSource = agentSourceRigIssues, agentSourceRigWisps
 	}
-	return loadAgentBeadsFromDir(currentBeadsDir, issueSource, wispSource)
+	return loadAgentBeadsFromDir(registryBeadsDir, issueSource, wispSource)
 }
 
 func loadAgentBeadsFromDir(beadsDir string, issueSource, wispSource agentBeadSource) ([]agentBeadCandidate, error) {
@@ -231,7 +284,7 @@ func pickBestAgentBead(candidates []agentBeadCandidate) (*agentBeadCandidate, er
 		sameRank = append(sameRank, candidate.ID)
 	}
 	if len(sameRank) > 1 {
-		return nil, fmt.Errorf("multiple matching agent beads in %s: %s", open[0].Source, strings.Join(sameRank, ", "))
+		return nil, &agentBeadResolveError{Kind: agentBeadAmbiguous, Candidates: sameRank}
 	}
 
 	return &open[0], nil
