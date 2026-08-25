@@ -128,6 +128,25 @@ export BD_ACTOR="gastown/crew/debug"
 bd create --title="Test issue"  # Will show created_by: gastown/crew/debug
 ```
 
+### Redirect identity mismatch recovery
+
+When a rig root contains `.beads/redirect`, the redirect target is canonical.
+Metadata beside the redirect is not authoritative and may be stale. If `bd`
+reports `PROJECT IDENTITY MISMATCH`, preserve both locations and pin the
+verified target explicitly:
+
+```bash
+export BEADS_DIR="/home/user/gt/gastown/mayor/rig/.beads"
+bd show gt-abc123
+```
+
+Replace the example path with the absolute target named by the rig root's
+`.beads/redirect`, after verifying that target read-only. Do not run `bd init`,
+edit or delete either metadata file, restart Dolt, or use generic
+`gt doctor --fix` while custody is unresolved. Gas Town's checked command paths
+follow the target without modifying redirect-local artifacts and fail with this
+same `BEADS_DIR` remediation when the target cannot be resolved safely.
+
 See [reference.md](reference.md#environment-variables) for the complete
 environment variable reference.
 

@@ -1,8 +1,10 @@
 package beads
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -3128,11 +3130,154 @@ func TestResolveBeadsDir(t *testing.T) {
 			t.Errorf("ResolveBeadsDir() = %q, want %q (should ignore circular redirect)", got, want)
 		}
 
-		// The circular redirect file should have been removed
-		if _, err := os.Stat(redirectPath); err == nil {
-			t.Error("circular redirect file should have been removed, but it still exists")
+		// Resolution is read-only: custody remains with the operator.
+		data, err := os.ReadFile(redirectPath)
+		if err != nil {
+			t.Fatalf("circular redirect file should be preserved: %v", err)
+		}
+		if string(data) != "../../mayor/rig/.beads\n" {
+			t.Fatalf("circular redirect changed during resolution: %q", data)
 		}
 	})
+}
+
+func TestResolveBeadsDirStrictCanonicalMatrixIgnoresRedirectLocalMetadata(t *testing.T) {
+	townRoot := t.TempDir()
+	rigRoot := filepath.Join(townRoot, "gastown")
+	canonical := filepath.Join(rigRoot, "mayor", "rig", ".beads")
+	if err := os.MkdirAll(canonical, 0755); err != nil {
+		t.Fatal(err)
+	}
+	canonicalMetadata := []byte(`{"dolt_database":"gastown","project_id":"canonical-project"}`)
+	if err := os.WriteFile(filepath.Join(canonical, "metadata.json"), canonicalMetadata, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	type redirectFixture struct {
+		name     string
+		workDir  string
+		redirect string
+	}
+	fixtures := []redirectFixture{
+		{name: "rig root", workDir: rigRoot, redirect: "mayor/rig/.beads\n"},
+		{name: "refinery", workDir: filepath.Join(rigRoot, "refinery", "rig"), redirect: "../../mayor/rig/.beads\n"},
+		{name: "witness", workDir: filepath.Join(rigRoot, "witness"), redirect: "../mayor/rig/.beads\n"},
+	}
+	staleMetadata := []byte(`{"dolt_database":"hq","project_id":"stale-project"}`)
+	for _, fixture := range fixtures {
+		beadsDir := filepath.Join(fixture.workDir, ".beads")
+		if err := os.MkdirAll(beadsDir, 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(beadsDir, "redirect"), []byte(fixture.redirect), 0644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(beadsDir, "metadata.json"), staleMetadata, 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	fixtures = append(fixtures, redirectFixture{name: "mayor canonical", workDir: filepath.Join(rigRoot, "mayor", "rig")})
+	for _, fixture := range fixtures {
+		t.Run(fixture.name, func(t *testing.T) {
+			resolved, err := ResolveBeadsDirStrict(fixture.workDir)
+			if err != nil {
+				t.Fatalf("ResolveBeadsDirStrict(%q): %v", fixture.workDir, err)
+			}
+			if resolved != canonical {
+				t.Fatalf("resolved = %q, want canonical %q", resolved, canonical)
+			}
+
+			env := envMap(BuildPinnedBDEnv([]string{
+				"PATH=/usr/bin",
+				"BEADS_DIR=" + filepath.Join(townRoot, ".beads"),
+				"BEADS_DOLT_SERVER_DATABASE=hq",
+			}, fixture.workDir))
+			if env["BEADS_DIR"] != canonical || env["BEADS_DOLT_SERVER_DATABASE"] != "gastown" {
+				t.Fatalf("pinned env did not use canonical identity: %v", env)
+			}
+		})
+	}
+
+	for _, fixture := range fixtures[:len(fixtures)-1] {
+		beadsDir := filepath.Join(fixture.workDir, ".beads")
+		gotMetadata, err := os.ReadFile(filepath.Join(beadsDir, "metadata.json"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(gotMetadata, staleMetadata) {
+			t.Fatalf("%s redirect-local metadata changed: %q", fixture.name, gotMetadata)
+		}
+		gotRedirect, err := os.ReadFile(filepath.Join(beadsDir, "redirect"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(gotRedirect) != fixture.redirect {
+			t.Fatalf("%s redirect changed: %q", fixture.name, gotRedirect)
+		}
+	}
+}
+
+func TestResolveBeadsDirStrictFailsClosedWithoutMutation(t *testing.T) {
+	workDir := t.TempDir()
+	beadsDir := filepath.Join(workDir, ".beads")
+	if err := os.MkdirAll(beadsDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	redirect := []byte("missing/canonical/.beads\n")
+	metadata := []byte(`{"dolt_database":"hq","project_id":"stale-project"}`)
+	if err := os.WriteFile(filepath.Join(beadsDir, "redirect"), redirect, 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(beadsDir, "metadata.json"), metadata, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := ResolveBeadsDirStrict(workDir)
+	if !errors.Is(err, ErrBeadsRedirectResolution) {
+		t.Fatalf("error = %v, want ErrBeadsRedirectResolution", err)
+	}
+	for _, want := range []string{"safe remediation", "BEADS_DIR=", "preserve existing .beads files", "do not run bd init", "gt doctor --fix"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("error %q missing %q", err, want)
+		}
+	}
+	gotRedirect, readErr := os.ReadFile(filepath.Join(beadsDir, "redirect"))
+	if readErr != nil || !bytes.Equal(gotRedirect, redirect) {
+		t.Fatalf("redirect was mutated: data=%q err=%v", gotRedirect, readErr)
+	}
+	gotMetadata, readErr := os.ReadFile(filepath.Join(beadsDir, "metadata.json"))
+	if readErr != nil || !bytes.Equal(gotMetadata, metadata) {
+		t.Fatalf("metadata was mutated: data=%q err=%v", gotMetadata, readErr)
+	}
+}
+
+func TestResolveBeadsDirStrictDepthErrorUsesAbsoluteRemediation(t *testing.T) {
+	root := t.TempDir()
+	workDir := filepath.Join(root, "start")
+	current := filepath.Join(workDir, ".beads")
+	for i := 0; i <= maxBeadsRedirectDepth; i++ {
+		if err := os.MkdirAll(current, 0755); err != nil {
+			t.Fatal(err)
+		}
+		next := filepath.Join(root, fmt.Sprintf("hop-%d", i), ".beads")
+		rel, err := filepath.Rel(filepath.Dir(current), next)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(current, "redirect"), []byte(rel+"\n"), 0644); err != nil {
+			t.Fatal(err)
+		}
+		current = next
+	}
+
+	_, err := ResolveBeadsDirStrict(workDir)
+	if !errors.Is(err, ErrBeadsRedirectResolution) {
+		t.Fatalf("error = %v, want ErrBeadsRedirectResolution", err)
+	}
+	if !strings.Contains(err.Error(), "BEADS_DIR="+current) {
+		t.Fatalf("error does not contain absolute remediation target %q: %v", current, err)
+	}
 }
 
 func TestParseAgentBeadID(t *testing.T) {

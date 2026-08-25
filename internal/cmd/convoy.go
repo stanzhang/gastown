@@ -465,7 +465,7 @@ func runBdJSONWithAutoCommit(dir string, args ...string) ([]byte, error) {
 }
 
 func runBdJSONWithOptions(dir string, allowStale, autoCommit bool, args ...string) ([]byte, error) {
-	var stdout, stderr bytes.Buffer
+	var stderr bytes.Buffer
 	bdc := BdCmd(args...).Dir(dir).StripBeadsDir().Stderr(&stderr)
 	if allowStale {
 		bdc.AllowStale()
@@ -473,17 +473,14 @@ func runBdJSONWithOptions(dir string, allowStale, autoCommit bool, args ...strin
 	if autoCommit {
 		bdc.WithAutoCommit()
 	}
-	cmd := bdc.Build()
-	cmd.Dir = dir
-	cmd.Stdout = &stdout
-
-	if err := cmd.Run(); err != nil {
+	stdout, err := bdc.Output()
+	if err != nil {
 		if errMsg := strings.TrimSpace(stderr.String()); errMsg != "" {
 			return nil, fmt.Errorf("bd %s: %s", args[0], errMsg)
 		}
 		return nil, fmt.Errorf("bd %s: %w", args[0], err)
 	}
-	return stdout.Bytes(), nil
+	return stdout, nil
 }
 
 // bdDepListRawIDs queries the raw dependencies table via bd sql to get

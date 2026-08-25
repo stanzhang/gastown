@@ -624,6 +624,35 @@ func TestBdCmd_WithBeadsDirFollowsRedirectBeforeMetadata(t *testing.T) {
 	}
 }
 
+func TestBdCmdFailsClosedOnUnusableRedirect(t *testing.T) {
+	workDir := t.TempDir()
+	beadsDir := filepath.Join(workDir, ".beads")
+	if err := os.MkdirAll(beadsDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(beadsDir, "redirect"), []byte("missing/.beads\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	metadata := []byte(`{"dolt_database":"hq"}`)
+	if err := os.WriteFile(filepath.Join(beadsDir, "metadata.json"), metadata, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	err := BdCmd("show", "gt-abc", "--json").Dir(workDir).Run()
+	if err == nil {
+		t.Fatal("Run succeeded with an unusable redirect")
+	}
+	for _, want := range []string{"safe remediation", "BEADS_DIR=", "preserve existing .beads files"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("error %q missing %q", err, want)
+		}
+	}
+	got, readErr := os.ReadFile(filepath.Join(beadsDir, "metadata.json"))
+	if readErr != nil || !bytes.Equal(got, metadata) {
+		t.Fatalf("metadata was mutated: data=%q err=%v", got, readErr)
+	}
+}
+
 func TestBdCmd_WithBeadsDir_OverridesInherited(t *testing.T) {
 	// WithBeadsDir should override an inherited BEADS_DIR from the parent
 	// process. This is the core fix for gt-ctir: without overriding,
