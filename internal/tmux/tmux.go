@@ -35,6 +35,11 @@ var sessionNudgeLocks sync.Map // map[string]chan struct{}
 // blocking all future nudges to that session.
 const nudgeLockTimeout = 30 * time.Second
 
+// defaultCommandTimeout bounds every tmux subprocess. A tmux child can leave
+// stdout/stderr inherited by a descendant; without a deadline and WaitDelay,
+// Cmd.Wait can then block daemon startup indefinitely.
+const defaultCommandTimeout = 10 * time.Second
+
 // validSessionNameRe validates session names to prevent shell injection
 var validSessionNameRe = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
 
@@ -181,7 +186,8 @@ func BuildCommandContext(ctx context.Context, args ...string) *exec.Cmd {
 
 // Tmux wraps tmux operations.
 type Tmux struct {
-	socketName string // tmux socket name (-L flag), empty = default socket
+	socketName     string        // tmux socket name (-L flag), empty = default socket
+	commandTimeout time.Duration // zero uses defaultCommandTimeout
 }
 
 // noTownSocket is a sentinel socket name used when no town socket is configured.
@@ -221,7 +227,13 @@ func NewTmuxWithSocket(socket string) *Tmux {
 // All commands include -u flag for UTF-8 support regardless of locale settings.
 // See: https://github.com/steveyegge/gastown/issues/1219
 func (t *Tmux) run(args ...string) (string, error) {
-	return t.runContext(context.Background(), args...)
+	timeout := t.commandTimeout
+	if timeout <= 0 {
+		timeout = defaultCommandTimeout
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	return t.runContext(ctx, args...)
 }
 
 func (t *Tmux) commandContext(ctx context.Context, args ...string) *exec.Cmd {
@@ -246,6 +258,13 @@ func (t *Tmux) runContext(ctx context.Context, args ...string) (string, error) {
 
 	err := cmd.Run()
 	if err != nil {
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			command := "command"
+			if len(args) > 0 {
+				command = args[0]
+			}
+			return "", fmt.Errorf("tmux %s timed out: %w", command, context.DeadlineExceeded)
+		}
 		return "", t.wrapError(err, stderr.String(), args)
 	}
 

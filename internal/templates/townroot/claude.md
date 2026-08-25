@@ -21,6 +21,11 @@ query latency > 5s, unexpected empty results.
 reproduce. A blind restart destroys the evidence. Always use non-fatal
 diagnostics:
 
+For a locally managed server, the canonical PID metadata is
+`$GT_TOWN_ROOT/daemon/dolt.pid`. `{{cmd}} dolt dump` validates the live server
+and fails loudly when it cannot identify one; do not construct a signal command
+from an unchecked PID file.
+
 ```bash
 # 1. Capture process metadata and recent logs without signaling Dolt
 {{cmd}} dolt dump 2>&1 | tee /tmp/dolt-hang-$(date +%s).log

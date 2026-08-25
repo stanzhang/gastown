@@ -1,16 +1,43 @@
 package tmux
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"reflect"
 	"runtime"
 	"strings"
 	"testing"
 	"time"
 )
+
+func TestRunUsesBoundedDefaultWait(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake tmux uses a POSIX shell")
+	}
+
+	binDir := t.TempDir()
+	fakeTmux := filepath.Join(binDir, "tmux")
+	if err := os.WriteFile(fakeTmux, []byte("#!/bin/sh\nsleep 5\n"), 0o755); err != nil {
+		t.Fatalf("write fake tmux: %v", err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	tm := &Tmux{commandTimeout: 100 * time.Millisecond}
+	start := time.Now()
+	_, err := tm.run("show-environment", "-g")
+	elapsed := time.Since(start)
+
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("run error = %v, want context deadline exceeded", err)
+	}
+	if elapsed > time.Second {
+		t.Fatalf("bounded tmux wait took %v, want under 1s", elapsed)
+	}
+}
 
 func hasTmux() bool {
 	_, err := exec.LookPath("tmux")

@@ -59,8 +59,11 @@ type Daemon struct {
 	curator       *feed.Curator
 	convoyManager *ConvoyManager
 	beadsStores   map[string]beadsdk.Storage
-	doltServer    *DoltServerManager
-	krcPruner     *KRCPruner
+	// rigBeadLabelsLookup is a test seam for rig-status failure policy. In
+	// production, lookupRigBeadLabels reads the daemon's already-open store.
+	rigBeadLabelsLookup func(rigName, rigBeadID string) ([]string, error)
+	doltServer          *DoltServerManager
+	krcPruner           *KRCPruner
 
 	// disabledPatrols is loaded from town settings (disabled_patrols field).
 	// Provides a simple way to disable individual patrol dogs without editing
@@ -2221,10 +2224,8 @@ func (d *Daemon) isRigOperational(rigName string) (bool, string) {
 	}
 
 	rigBeadID := fmt.Sprintf("%s-rig-%s", prefix, rigName)
-	rigBeadsDir := beads.ResolveBeadsDir(rigPath)
-	bd := beads.NewWithBeadsDir(rigPath, rigBeadsDir)
-	if issue, err := bd.Show(rigBeadID); err == nil {
-		for _, label := range issue.Labels {
+	if labels, err := d.lookupRigBeadLabels(rigName, rigBeadID); err == nil {
+		for _, label := range labels {
 			if label == "status:docked" {
 				return false, "rig is docked (global)"
 			}
@@ -2233,12 +2234,19 @@ func (d *Daemon) isRigOperational(rigName string) (bool, string) {
 			}
 		}
 	} else {
-		// Log when rig bead lookup fails - this helps debug transient Dolt issues
-		// FAIL-SAFE: When we can't verify docked status (Dolt down, network issue, etc.),
-		// assume the rig is NOT operational. This prevents wasting API credits starting
-		// witnesses that might be docked. Better to delay work than burn credits unnecessarily.
-		d.logger.Printf("Warning: failed to check rig bead %s for docked/parked status: %v (assuming not operational)", rigBeadID, err)
-		return false, "cannot verify rig status (Dolt unavailable)"
+		switch classifyRigBeadLookupError(err) {
+		case rigBeadNotFound:
+			d.logger.Printf("Warning: rig bead %s not found; no global docked/parked override (keeping patrol active)", rigBeadID)
+		case rigBeadTimeout:
+			// A timeout is ambiguous: the server may be healthy while the host or
+			// subprocess is starved. Preserve oversight and retry next heartbeat.
+			d.logger.Printf("Warning: rig bead %s lookup timed out: %v (keeping patrol active; will retry next heartbeat)", rigBeadID, err)
+		case rigBeadConnection:
+			d.logger.Printf("Warning: rig bead %s lookup failed due to beads connection: %v (assuming not operational)", rigBeadID, err)
+			return false, "cannot verify rig status (beads connection unavailable)"
+		default:
+			d.logger.Printf("Warning: rig bead %s lookup failed unexpectedly: %v (keeping patrol active; will retry next heartbeat)", rigBeadID, err)
+		}
 	}
 
 	// Check auto_restart config
@@ -2257,6 +2265,93 @@ func (d *Daemon) isRigOperational(rigName string) (bool, string) {
 	}
 
 	return true, ""
+}
+
+const rigBeadLookupTimeout = 5 * time.Second
+
+var errRigBeadsStoreUnavailable = errors.New("rig beads store unavailable")
+
+type rigBeadFailureKind uint8
+
+const (
+	rigBeadUnknown rigBeadFailureKind = iota
+	rigBeadTimeout
+	rigBeadConnection
+	rigBeadNotFound
+)
+
+// lookupRigBeadLabels uses the daemon's persistent per-rig store instead of
+// spawning bd. This removes the 60-second subprocess from every patrol status
+// check and bounds the in-process read independently of the daemon lifetime.
+func (d *Daemon) lookupRigBeadLabels(rigName, rigBeadID string) ([]string, error) {
+	if d.rigBeadLabelsLookup != nil {
+		return d.rigBeadLabelsLookup(rigName, rigBeadID)
+	}
+
+	store := d.beadsStores[rigName]
+	if store == nil {
+		return nil, fmt.Errorf("%w for %s", errRigBeadsStoreUnavailable, rigName)
+	}
+
+	parent := d.ctx
+	if parent == nil {
+		parent = context.Background()
+	}
+	ctx, cancel := context.WithTimeout(parent, rigBeadLookupTimeout)
+	defer cancel()
+
+	issue, err := store.GetIssue(ctx, rigBeadID)
+	if err != nil {
+		if strings.Contains(strings.ToLower(err.Error()), "not found") {
+			return nil, beads.ErrNotFound
+		}
+		return nil, fmt.Errorf("store show %s: %w", rigBeadID, err)
+	}
+	if issue == nil {
+		return nil, beads.ErrNotFound
+	}
+	if issue.Labels != nil {
+		return issue.Labels, nil
+	}
+	labels, err := store.GetLabels(ctx, rigBeadID)
+	if err != nil {
+		return nil, fmt.Errorf("store labels %s: %w", rigBeadID, err)
+	}
+	return labels, nil
+}
+
+func classifyRigBeadLookupError(err error) rigBeadFailureKind {
+	if err == nil {
+		return rigBeadUnknown
+	}
+	if errors.Is(err, beads.ErrNotFound) {
+		return rigBeadNotFound
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return rigBeadTimeout
+	}
+	if errors.Is(err, errRigBeadsStoreUnavailable) {
+		return rigBeadConnection
+	}
+
+	msg := strings.ToLower(err.Error())
+	for _, marker := range []string{"timed out", "timeout", "deadline exceeded"} {
+		if strings.Contains(msg, marker) {
+			return rigBeadTimeout
+		}
+	}
+	for _, marker := range []string{
+		"connection refused", "connection reset", "broken pipe", "dial tcp",
+		"no route to host", "network is unreachable", "server unavailable",
+	} {
+		if strings.Contains(msg, marker) {
+			return rigBeadConnection
+		}
+	}
+	if strings.Contains(msg, "not found") || strings.Contains(msg, "no issue found") {
+		return rigBeadNotFound
+	}
+	return rigBeadUnknown
 }
 
 // processLifecycleRequests checks for and processes lifecycle requests.

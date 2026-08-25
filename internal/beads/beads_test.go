@@ -5614,3 +5614,19 @@ func TestResolveBdSubprocessTimeout(t *testing.T) {
 		})
 	}
 }
+
+func TestWrapSubprocessErrorPreservesTimeoutClassification(t *testing.T) {
+	// A completed CommandContext commonly reports signal: killed. Simulate the
+	// deadline identity that runWithStdin observes before wrapping that error.
+	deadlineCtx, deadlineCancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer deadlineCancel()
+
+	b := New(t.TempDir())
+	err := b.wrapSubprocessError(deadlineCtx, 250*time.Millisecond, errors.New("signal: killed"), "", []string{"show", "gt-rig"})
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("wrapSubprocessError() = %v, want deadline identity", err)
+	}
+	if !strings.Contains(err.Error(), "timed out after 250ms") {
+		t.Fatalf("wrapSubprocessError() = %v, want explicit timeout", err)
+	}
+}
