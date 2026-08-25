@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/steveyegge/gastown/internal/beads"
@@ -762,6 +763,88 @@ func TestRenderPatrolWispDescription_ExtraVarsOverrideRoleVars(t *testing.T) {
 	}
 }
 
+func TestPatrolSpawnArgsMaterializesFormulaSteps(t *testing.T) {
+	args := patrolSpawnArgs("mol-witness-patrol", "witness", []string{"rig=gastown", "prefix=gt"})
+	joined := strings.Join(args, " ")
+	if strings.Contains(joined, "--root-only") {
+		t.Fatalf("patrol creation must materialize steps, got args: %s", joined)
+	}
+	for _, want := range []string{"mol wisp create mol-witness-patrol", "--actor witness", "--var rig=gastown", "--var prefix=gt"} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("spawn args missing %q: %s", want, joined)
+		}
+	}
+}
+
+func TestAcquirePatrolCycleLockSerializesSuccessorHandoff(t *testing.T) {
+	cfg := PatrolConfig{BeadsDir: t.TempDir(), Assignee: "testrig/witness"}
+	unlockFirst, err := acquirePatrolCycleLock(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	acquired := make(chan func(), 1)
+	errs := make(chan error, 1)
+	go func() {
+		unlock, lockErr := acquirePatrolCycleLock(cfg)
+		if lockErr != nil {
+			errs <- lockErr
+			return
+		}
+		acquired <- unlock
+	}()
+
+	select {
+	case unlock := <-acquired:
+		unlock()
+		unlockFirst()
+		t.Fatal("second patrol reporter acquired the role lock before the first released it")
+	case err := <-errs:
+		unlockFirst()
+		t.Fatal(err)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	unlockFirst()
+	select {
+	case unlock := <-acquired:
+		unlock()
+	case err := <-errs:
+		t.Fatal(err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("second patrol reporter did not acquire the role lock after release")
+	}
+}
+
+func TestBuildPatrolWispDescriptionCarriesExecutableAttachment(t *testing.T) {
+	at := time.Date(2026, time.August, 25, 14, 4, 0, 123, time.UTC)
+	desc, err := buildPatrolWispDescription(PatrolConfig{
+		PatrolMolName: constants.MolDeaconPatrol,
+		BeadsDir:      t.TempDir(),
+		Assignee:      "deacon/",
+	}, at)
+	if err != nil {
+		t.Fatalf("buildPatrolWispDescription: %v", err)
+	}
+	fields := beads.ParseAttachmentFields(&beads.Issue{Description: desc})
+	if fields == nil {
+		t.Fatalf("patrol description has no attachment metadata:\n%s", desc)
+	}
+	if fields.AttachedFormula != constants.MolDeaconPatrol {
+		t.Fatalf("attached_formula = %q, want %q", fields.AttachedFormula, constants.MolDeaconPatrol)
+	}
+	if fields.AttachedMolecule != "" {
+		t.Fatalf("standalone patrol must not self-reference attached_molecule: %q", fields.AttachedMolecule)
+	}
+	if fields.AttachedAt != at.Format(time.RFC3339Nano) {
+		t.Fatalf("attached_at = %q, want %q", fields.AttachedAt, at.Format(time.RFC3339Nano))
+	}
+	for _, want := range []string{"wisp: true", "instantiated_from: " + constants.MolDeaconPatrol, "**Formula Checklist**"} {
+		if !strings.Contains(desc, want) {
+			t.Fatalf("patrol description missing %q:\n%s", want, desc)
+		}
+	}
+}
+
 func TestUpdatePatrolWispDescriptionUsesBodyFileStdin(t *testing.T) {
 	binDir := t.TempDir()
 	logFile := filepath.Join(t.TempDir(), "bd.log")
@@ -880,6 +963,77 @@ func createHookedPatrol(t *testing.T, b *beads.Beads, molName, assignee string, 
 	return root.ID
 }
 
+func TestValidatePatrolMaterializationRequiresEveryFormulaStep(t *testing.T) {
+	requireBd(t)
+	tmpDir, b := setupPatrolTestDB(t)
+	cfg := PatrolConfig{
+		RoleName:      "deacon",
+		PatrolMolName: constants.MolDeaconPatrol,
+		BeadsDir:      tmpDir,
+		Assignee:      "deacon/",
+		Beads:         b,
+	}
+	f, _, err := resolveFormulaForRendering(cfg.PatrolMolName, cfg.BeadsDir, "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stepIDs := f.GetAllIDs()
+	if len(stepIDs) < 2 {
+		t.Fatalf("test requires multiple patrol steps, got %v", stepIDs)
+	}
+	root, err := b.Create(beads.CreateOptions{Title: cfg.PatrolMolName + " (wisp)", Priority: -1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	createStep := func(stepID string) {
+		t.Helper()
+		if _, createErr := b.Create(beads.CreateOptions{
+			Title:       stepID,
+			Description: "instantiated_from: " + cfg.PatrolMolName + "\ntemplate_step: " + stepID,
+			Parent:      root.ID,
+			Priority:    -1,
+		}); createErr != nil {
+			t.Fatal(createErr)
+		}
+	}
+	createStep(stepIDs[0])
+	if err := validatePatrolMaterialization(cfg, root.ID); err == nil || !strings.Contains(err.Error(), "1/") {
+		t.Fatalf("partial materialization error = %v, want step-count failure", err)
+	}
+	for _, stepID := range stepIDs[1:] {
+		createStep(stepID)
+	}
+	if err := validatePatrolMaterialization(cfg, root.ID); err != nil {
+		t.Fatalf("complete materialization rejected: %v", err)
+	}
+}
+
+func TestFailClosedPatrolClosesNewRootAndSteps(t *testing.T) {
+	requireBd(t)
+	tmpDir, b := setupPatrolTestDB(t)
+	rootID := createHookedPatrol(t, b, "mol-test-patrol", "testrig/witness", true)
+	cfg := PatrolConfig{BeadsDir: tmpDir, Beads: b}
+	if err := failClosedPatrol(cfg, rootID, "test partial failure"); err != nil {
+		t.Fatalf("failClosedPatrol: %v", err)
+	}
+	root, err := b.Show(rootID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if root.Status != "closed" {
+		t.Fatalf("partial root status = %q, want closed", root.Status)
+	}
+	children, err := b.List(beads.ListOptions{Parent: rootID, Status: "all", Priority: -1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, child := range children {
+		if child.Status != "closed" {
+			t.Fatalf("partial child %s status = %q, want closed", child.ID, child.Status)
+		}
+	}
+}
+
 func TestFindActivePatrolHooked(t *testing.T) {
 	requireBd(t)
 	tmpDir, b := setupPatrolTestDB(t)
@@ -953,13 +1107,13 @@ func TestFindActivePatrolStale(t *testing.T) {
 		t.Fatal("expected stale patrol (all children closed) to NOT be found as active")
 	}
 
-	// Verify the stale patrol was closed
+	// Discovery must preserve historical patrol evidence.
 	issue, err := b.Show(rootID)
 	if err != nil {
 		t.Fatalf("show patrol: %v", err)
 	}
-	if issue.Status != "closed" {
-		t.Errorf("stale patrol status = %q, want %q", issue.Status, "closed")
+	if issue.Status != beads.StatusHooked {
+		t.Errorf("stale patrol status = %q, want %q (discovery is read-only)", issue.Status, beads.StatusHooked)
 	}
 }
 
@@ -970,9 +1124,7 @@ func TestFindActivePatrolZeroChildren(t *testing.T) {
 	molName := "mol-test-patrol"
 	assignee := "testrig/witness"
 
-	// Create a patrol with NO children — simulates a freshly created wisp
-	// whose steps haven't materialized yet. Should be treated as active,
-	// not stale, to prevent race condition.
+	// A hooked root with no children reproduces the historical naked-hook bug.
 	rootID := createHookedPatrol(t, b, molName, assignee, false /* no children */)
 
 	cfg := PatrolConfig{
@@ -982,15 +1134,12 @@ func TestFindActivePatrolZeroChildren(t *testing.T) {
 		Beads:         b,
 	}
 
-	patrolID, _, found, findErr := findActivePatrol(cfg)
+	_, _, found, findErr := findActivePatrol(cfg)
 	if findErr != nil {
 		t.Fatalf("findActivePatrol error: %v", findErr)
 	}
-	if !found {
-		t.Fatal("expected zero-children patrol to be treated as active (not stale)")
-	}
-	if patrolID != rootID {
-		t.Errorf("patrolID = %q, want %q", patrolID, rootID)
+	if found {
+		t.Fatal("zero-children patrol must not become authoritative hooked work")
 	}
 
 	// Verify it was NOT closed
@@ -999,7 +1148,7 @@ func TestFindActivePatrolZeroChildren(t *testing.T) {
 		t.Fatalf("show patrol: %v", err)
 	}
 	if issue.Status != beads.StatusHooked {
-		t.Errorf("zero-children patrol status = %q, want %q (should remain hooked)", issue.Status, beads.StatusHooked)
+		t.Errorf("zero-children patrol status = %q, want %q (historical evidence must remain untouched)", issue.Status, beads.StatusHooked)
 	}
 }
 
@@ -1055,34 +1204,26 @@ func TestFindActivePatrolMultiple(t *testing.T) {
 		t.Errorf("active patrol status = %q, want %q", issue.Status, beads.StatusHooked)
 	}
 
-	// Stale patrol cleanup is not guaranteed when an active patrol is found —
-	// findActivePatrol breaks early on active discovery to prevent N+1 Dolt queries
-	// (gt-18dzn6p). Remaining stale beads are cleaned by burnPreviousPatrolWisps
-	// when the patrol cycle ends. Verify stale beads are either closed or still hooked
-	// (not left in an intermediate broken state).
+	// Selection is read-only: historical roots remain untouched.
 	for _, id := range []string{stale1, stale2} {
 		staleIssue, showErr := b.Show(id)
 		if showErr != nil {
 			t.Fatalf("show stale %s: %v", id, showErr)
 		}
-		if staleIssue.Status != "closed" && staleIssue.Status != beads.StatusHooked {
-			t.Errorf("stale patrol %s status = %q, want closed or hooked", id, staleIssue.Status)
+		if staleIssue.Status != beads.StatusHooked {
+			t.Errorf("stale patrol %s status = %q, want hooked", id, staleIssue.Status)
 		}
 	}
 }
 
-// TestFindActivePatrol_StaleCleanupCapped verifies that when many stale patrols
-// accumulate with no active patrol, cleanup is capped at maxStalePurgePerRun per call
-// to prevent overwhelming Dolt with sequential write queries (gt-18dzn6p).
-func TestFindActivePatrol_StaleCleanupCapped(t *testing.T) {
+func TestFindActivePatrol_PreservesHistoricalWisps(t *testing.T) {
 	requireBd(t)
 	tmpDir, b := setupPatrolTestDB(t)
 
 	molName := "mol-test-patrol"
 	assignee := "testrig/witness"
 
-	// Create more stale patrols than maxStalePurgePerRun (currently 5)
-	numStale := maxStalePurgePerRun + 3 // e.g., 8 total
+	const numStale = 8
 	staleIDs := make([]string, numStale)
 	for i := 0; i < numStale; i++ {
 		id := createHookedPatrol(t, b, molName, assignee, true /* with child */)
@@ -1115,122 +1256,14 @@ func TestFindActivePatrol_StaleCleanupCapped(t *testing.T) {
 		t.Fatal("expected no active patrol (all stale)")
 	}
 
-	// Count how many stale patrols were actually closed
-	closedCount := 0
-	hookedCount := 0
+	// Discovery must not mutate or burn historical roots.
 	for _, id := range staleIDs {
 		issue, err := b.Show(id)
 		if err != nil {
 			t.Fatalf("show stale %s: %v", id, err)
 		}
-		switch issue.Status {
-		case "closed":
-			closedCount++
-		case beads.StatusHooked:
-			hookedCount++
-		default:
-			t.Errorf("stale patrol %s unexpected status %q", id, issue.Status)
+		if issue.Status != beads.StatusHooked {
+			t.Errorf("historical patrol %s status = %q, want hooked", id, issue.Status)
 		}
-	}
-
-	// Cleanup must be capped: at most maxStalePurgePerRun beads closed per run
-	if closedCount > maxStalePurgePerRun {
-		t.Errorf("closed %d stale patrols, want at most %d (cap exceeded — Dolt DoS risk)",
-			closedCount, maxStalePurgePerRun)
-	}
-	// But at least some cleanup must happen (the cap should not be zero)
-	if closedCount == 0 {
-		t.Errorf("no stale patrols were closed, expected up to %d", maxStalePurgePerRun)
-	}
-	// Total accounted for
-	if closedCount+hookedCount != numStale {
-		t.Errorf("closed=%d + hooked=%d != total=%d", closedCount, hookedCount, numStale)
-	}
-}
-
-func TestBurnPreviousPatrolWisps(t *testing.T) {
-	requireBd(t)
-	tmpDir, b := setupPatrolTestDB(t)
-
-	molName := "mol-test-patrol"
-	assignee := "testrig/witness"
-
-	// Create 3 hooked patrol wisps (simulating accumulated orphans)
-	id1 := createHookedPatrol(t, b, molName, assignee, true)
-	id2 := createHookedPatrol(t, b, molName, assignee, false)
-	id3 := createHookedPatrol(t, b, molName, assignee, true)
-
-	cfg := PatrolConfig{
-		PatrolMolName: molName,
-		BeadsDir:      tmpDir,
-		Assignee:      assignee,
-		Beads:         b,
-	}
-
-	burnPreviousPatrolWisps(cfg)
-
-	// All 3 patrols should now be closed
-	for _, id := range []string{id1, id2, id3} {
-		issue, err := b.Show(id)
-		if err != nil {
-			t.Fatalf("show %s: %v", id, err)
-		}
-		if issue.Status != "closed" {
-			t.Errorf("patrol %s status = %q, want %q after burn", id, issue.Status, "closed")
-		}
-	}
-}
-
-func TestBurnPreviousPatrolWisps_IgnoresOtherBeads(t *testing.T) {
-	requireBd(t)
-	tmpDir, b := setupPatrolTestDB(t)
-
-	molName := "mol-test-patrol"
-	assignee := "testrig/witness"
-
-	// Create a patrol wisp (should be burned)
-	patrolID := createHookedPatrol(t, b, molName, assignee, true)
-
-	// Create a non-patrol hooked bead (should NOT be burned)
-	other, err := b.Create(beads.CreateOptions{
-		Title:    "some-other-work",
-		Priority: -1,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	hooked := beads.StatusHooked
-	if err := b.Update(other.ID, beads.UpdateOptions{
-		Status:   &hooked,
-		Assignee: &assignee,
-	}); err != nil {
-		t.Fatal(err)
-	}
-
-	cfg := PatrolConfig{
-		PatrolMolName: molName,
-		BeadsDir:      tmpDir,
-		Assignee:      assignee,
-		Beads:         b,
-	}
-
-	burnPreviousPatrolWisps(cfg)
-
-	// Patrol should be closed
-	issue, err := b.Show(patrolID)
-	if err != nil {
-		t.Fatalf("show patrol: %v", err)
-	}
-	if issue.Status != "closed" {
-		t.Errorf("patrol status = %q, want %q", issue.Status, "closed")
-	}
-
-	// Non-patrol bead should still be hooked
-	otherIssue, err := b.Show(other.ID)
-	if err != nil {
-		t.Fatalf("show other: %v", err)
-	}
-	if otherIssue.Status != beads.StatusHooked {
-		t.Errorf("non-patrol bead status = %q, want %q (should not be burned)", otherIssue.Status, beads.StatusHooked)
 	}
 }

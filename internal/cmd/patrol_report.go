@@ -2,7 +2,6 @@ package cmd
 
 import (
 	"fmt"
-	"os"
 	"strings"
 
 	"github.com/spf13/cobra"
@@ -61,7 +60,7 @@ func runPatrolReport(cmd *cobra.Command, args []string) error {
 			RoleName:      "deacon",
 			PatrolMolName: constants.MolDeaconPatrol,
 			BeadsDir:      roleInfo.TownRoot,
-			Assignee:      "deacon",
+			Assignee:      "deacon/",
 		}
 	case RoleWitness:
 		cfg = PatrolConfig{
@@ -90,6 +89,26 @@ func runPatrolReport(cmd *cobra.Command, args []string) error {
 	if !hasPatrol {
 		return fmt.Errorf("no active patrol found for %s", cfg.RoleName)
 	}
+	expectedPatrolID := patrolID
+
+	// Serialize the close/create handoff. Re-resolve after locking so a second
+	// reporter for the same cycle cannot close the successor created by the first.
+	unlock, err := acquirePatrolCycleLock(cfg)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	patrolID, _, hasPatrol, findErr = findActivePatrol(cfg)
+	if findErr != nil {
+		return fmt.Errorf("rechecking active patrol: %w", findErr)
+	}
+	if !hasPatrol {
+		return fmt.Errorf("active patrol %s disappeared before report", expectedPatrolID)
+	}
+	if patrolID != expectedPatrolID {
+		fmt.Printf("Patrol already advanced: %s\n", patrolID)
+		return nil
+	}
 
 	// Close the current patrol root with the summary
 	b := cfg.Beads
@@ -105,7 +124,7 @@ func runPatrolReport(cmd *cobra.Command, args []string) error {
 	if err := b.Update(patrolID, beads.UpdateOptions{
 		Description: &desc,
 	}); err != nil {
-		style.PrintWarning("could not update patrol summary: %v", err)
+		return fmt.Errorf("recording patrol summary on %s: %w", patrolID, err)
 	}
 
 	// Print the step audit for visibility
@@ -127,14 +146,16 @@ func runPatrolReport(cmd *cobra.Command, args []string) error {
 	fmt.Printf("%s Closed patrol %s\n", style.Success.Render("✓"), patrolID)
 
 	// Start next cycle
-	newPatrolID, err := autoSpawnPatrol(cfg)
+	newPatrolID, err := autoSpawnPatrolLocked(cfg)
 	if err != nil {
-		if newPatrolID != "" {
-			fmt.Fprintf(os.Stderr, "warning: %s\n", err.Error())
-			fmt.Printf("New patrol: %s\n", newPatrolID)
-			return nil
-		}
 		return fmt.Errorf("starting next patrol cycle: %w", err)
+	}
+	resolvedID, _, found, resolveErr := findActivePatrol(cfg)
+	if resolveErr != nil {
+		return fmt.Errorf("verifying next patrol cycle: %w", resolveErr)
+	}
+	if !found || resolvedID != newPatrolID {
+		return fmt.Errorf("next patrol disagreement: created %s but hook resolves %s", newPatrolID, resolvedID)
 	}
 
 	fmt.Printf("%s Started new patrol: %s\n", style.Success.Render("✓"), newPatrolID)
