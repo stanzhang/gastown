@@ -47,8 +47,8 @@ var ValidAgentRoles = []string{
 	"dog",                  // Town-level with name: gt-dog-<name>
 	constants.RoleWitness,  // Per-rig: gt-<rig>-witness
 	constants.RoleRefinery, // Per-rig: gt-<rig>-refinery
-	constants.RoleCrew,    // Per-rig with name: gt-<rig>-crew-<name>
-	constants.RolePolecat, // Per-rig with name: gt-<rig>-polecat-<name>
+	constants.RoleCrew,     // Per-rig with name: gt-<rig>-crew-<name>
+	constants.RolePolecat,  // Per-rig with name: gt-<rig>-polecat-<name>
 }
 
 // TownLevelRoles are agent roles that don't have a rig.
@@ -363,7 +363,8 @@ func PolecatBeadID(rig, name string) string {
 // Returns rig, role, name, and whether parsing succeeded.
 // For town-level agents, rig will be empty.
 // For singletons, name will be empty.
-// Accepts any valid prefix (e.g., "gt-", "bd-"), not just "gt-".
+// Accepts any valid prefix of at least two characters (e.g., "gt-", "bd-",
+// "qlib-"), not just "gt-".
 //
 // Handles the collapsed form where prefix == rig (e.g., "ff-witness" for rig "ff").
 // In collapsed form, the prefix is returned as the rig:
@@ -371,9 +372,11 @@ func PolecatBeadID(rig, name string) string {
 //   - "ff-polecat-nux" → rig="ff", role="polecat", name="nux"
 func ParseAgentBeadID(id string) (rig, role, name string, ok bool) {
 	// Find the prefix (everything before the first hyphen)
-	// Valid prefixes are 2-3 characters (e.g., "gt", "bd", "hq")
+	// Prefixes must contain at least two characters. Do not impose an upper
+	// bound: a rig can use its full name as the prefix, and collapsed agent IDs
+	// then look like "qlib-witness" or "qlib-refinery".
 	hyphenIdx := strings.Index(id, "-")
-	if hyphenIdx < 2 || hyphenIdx > 3 {
+	if hyphenIdx < 2 {
 		return "", "", "", false
 	}
 

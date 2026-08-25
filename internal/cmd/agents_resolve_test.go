@@ -104,6 +104,25 @@ func TestAgentBeadMatchesDescriptionAndIDFallback(t *testing.T) {
 			want: true,
 		},
 		{
+			name: "collapsed long prefix-rig ID fallback matches sparse metadata",
+			issue: &beads.Issue{
+				ID: "qlib-witness",
+			},
+			role: "witness",
+			rig:  "qlib",
+			want: true,
+		},
+		{
+			name: "structured description fallback matches long prefix wisp ID",
+			issue: &beads.Issue{
+				ID:          "qlib-wisp-r4nd0m",
+				Description: "Agent\n\nrole_type: refinery\nrig: qlib",
+			},
+			role: "refinery",
+			rig:  "qlib",
+			want: true,
+		},
+		{
 			name: "role mismatch",
 			issue: &beads.Issue{
 				ID:          "gt-gastown-witness",
