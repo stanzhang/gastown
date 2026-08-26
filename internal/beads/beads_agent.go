@@ -238,7 +238,12 @@ func (b *Beads) CreateAgentBead(id, title string, fields *AgentFields) (*Issue, 
 			"--type=task",
 			"--labels=gt:agent",
 		}
-		if NeedsForceForID(id) {
+		// Rig agent beads are intentionally stored in the town database so their
+		// lifecycle is available to town-level coordinators. Their explicit IDs
+		// retain the rig prefix, though, so bd must be told to accept that prefix
+		// even for singleton IDs such as "qar-witness" (which do not satisfy the
+		// generic multi-hyphen NeedsForceForID rule).
+		if needsForceForAgentID(id, fields) {
 			a = append(a, "--force")
 		}
 		// Default actor from BD_ACTOR env var for provenance tracking
@@ -266,6 +271,10 @@ func (b *Beads) CreateAgentBead(id, title string, fields *AgentFields) (*Issue, 
 	// Note: hook_bead slot no longer set - bd slot removed in v0.62 (hq-l6mm5)
 
 	return &issue, nil
+}
+
+func needsForceForAgentID(id string, fields *AgentFields) bool {
+	return NeedsForceForID(id) || (fields != nil && fields.Rig != "")
 }
 
 func (b *Beads) createAgentBeadViaStore(ctx context.Context, id, title, description string) (*Issue, error) {

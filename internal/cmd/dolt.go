@@ -616,13 +616,20 @@ func runDoltStatus(cmd *cobra.Command, args []string) error {
 		// Load state for more details
 		state, err := doltserver.LoadState(townRoot)
 		if err == nil && !state.StartedAt.IsZero() {
+			// The state file records the databases present when the server started.
+			// Rig databases can be added to the live catalog afterward, so status
+			// must refresh this field instead of presenting the stale snapshot.
+			databases := state.Databases
+			if liveDatabases, listErr := doltserver.ListDatabases(townRoot); listErr == nil {
+				databases = liveDatabases
+			}
 			fmt.Printf("  Started: %s\n", state.StartedAt.Format("2006-01-02 15:04:05"))
 			fmt.Printf("  Port: %d\n", state.Port)
 			fmt.Printf("  Data dir: %s\n", state.DataDir)
-			if len(state.Databases) > 0 {
+			if len(databases) > 0 {
 				owners := doltserver.CollectDatabaseOwners(townRoot)
 				fmt.Printf("  Databases:\n")
-				for _, db := range state.Databases {
+				for _, db := range databases {
 					if owner, ok := owners[db]; ok {
 						fmt.Printf("    - %-20s (%s)\n", db, owner)
 					} else {

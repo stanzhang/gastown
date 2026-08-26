@@ -447,6 +447,15 @@ func TestLabelsForAgentBeadReusePreservesOnlySafetyStop(t *testing.T) {
 	}
 }
 
+func TestNeedsForceForRigAgentSingletonID(t *testing.T) {
+	if !needsForceForAgentID("qar-witness", &AgentFields{RoleType: "witness", Rig: "qar"}) {
+		t.Fatal("rig singleton agent ID must use --force when stored in the town database")
+	}
+	if needsForceForAgentID("hq-mayor", &AgentFields{RoleType: "mayor"}) {
+		t.Fatal("town singleton agent ID should not require --force")
+	}
+}
+
 func installMockBDCreateRecorder(t *testing.T, logPath string) {
 	t.Helper()
 

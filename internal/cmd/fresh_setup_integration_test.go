@@ -109,6 +109,74 @@ func TestFreshInstallRigPolecatHookIntegration(t *testing.T) {
 	})
 }
 
+// TestFreshRigAddProvisionsDatabaseAgentsAndAcceptsSling covers the complete
+// fresh-town contract for a rig whose repository tracks .beads/config.yaml.
+// That shape makes the rig root use a .beads/redirect, as Gas Town itself does.
+func TestFreshRigAddProvisionsDatabaseAgentsAndAcceptsSling(t *testing.T) {
+	if _, err := exec.LookPath("bd"); err != nil {
+		t.Skip("bd not installed, skipping fresh rig integration test")
+	}
+	if _, err := exec.LookPath("dolt"); err != nil {
+		t.Skip("dolt not installed, skipping fresh rig integration test")
+	}
+
+	tmpDir := resolveSymlinks(t, t.TempDir())
+	hqPath := filepath.Join(tmpDir, "town")
+	doltPort := freeTCPPort(t)
+	doltPortString := strconv.Itoa(doltPort)
+	t.Setenv("GT_DOLT_PORT", doltPortString)
+	t.Setenv("BEADS_DOLT_PORT", doltPortString)
+
+	env := freshSetupIntegrationEnv(tmpDir, doltPortString)
+	configureGitIdentityForEnv(t, env)
+
+	gtBinary := buildGT(t)
+	runFreshSetupCmd(t, "", env, gtBinary, "install", hqPath, "--name", "dp7-town", "--git", "--dolt-port", doltPortString)
+	t.Cleanup(func() {
+		cmd := exec.Command(gtBinary, "dolt", "stop")
+		cmd.Dir = hqPath
+		cmd.Env = env
+		_ = cmd.Run()
+	})
+
+	rigName := fmt.Sprintf("dp7r%d", freshSetupIntegrationCounter.Add(1))
+	repoDir := createFreshSetupTrackedBeadsRepo(t, tmpDir, rigName)
+	repoURL := (&url.URL{Scheme: "file", Path: repoDir}).String()
+	runFreshSetupCmd(t, hqPath, env, gtBinary, "rig", "add", rigName, repoURL, "--prefix", rigName, "--branch", "main")
+
+	rigPath := filepath.Join(hqPath, rigName)
+	rigBeadsDir := filepath.Join(rigPath, ".beads")
+	if _, err := os.Stat(filepath.Join(hqPath, ".dolt-data", rigName, ".dolt", "noms", "manifest")); err != nil {
+		t.Fatalf("rig database %q was not provisioned: %v", rigName, err)
+	}
+	if _, err := os.Stat(filepath.Join(rigBeadsDir, "redirect")); err != nil {
+		t.Fatalf("tracked-beads rig did not create .beads/redirect: %v", err)
+	}
+	assertBeadsRedirectResolves(t, rigBeadsDir)
+
+	status := runFreshSetupCmd(t, hqPath, env, gtBinary, "dolt", "status")
+	if !strings.Contains(status, "- "+rigName) {
+		t.Fatalf("gt dolt status omitted newly provisioned database %q:\n%s", rigName, status)
+	}
+
+	for _, id := range []string{
+		beads.WitnessBeadIDWithPrefix(rigName, rigName),
+		beads.RefineryBeadIDWithPrefix(rigName, rigName),
+	} {
+		runFreshSetupOutputCmd(t, hqPath, env, "bd", "show", id, "--json")
+	}
+
+	issue := createFreshSetupIssue(t, rigPath, env, "Fresh rig sling acceptance")
+	if !strings.HasPrefix(issue.ID, rigName+"-") {
+		t.Fatalf("created issue ID %q does not use rig prefix %q", issue.ID, rigName+"-")
+	}
+	runFreshSetupCmd(t, hqPath, env, gtBinary, "config", "set", "scheduler.max_polecats", "1")
+	slingOutput := runFreshSetupCmd(t, hqPath, env, gtBinary, "sling", issue.ID, rigName, "--no-convoy", "--no-boot")
+	if !strings.Contains(slingOutput, "Scheduled "+issue.ID+" → "+rigName) {
+		t.Fatalf("gt sling did not accept work for fresh rig:\n%s", slingOutput)
+	}
+}
+
 type freshSetupIssue struct {
 	ID       string `json:"id"`
 	Title    string `json:"title"`
@@ -159,6 +227,28 @@ func createFreshSetupSourceRepo(t *testing.T, tmpDir string) string {
 	}
 	runFreshSetupCmd(t, repoDir, nil, "git", "add", ".")
 	runFreshSetupCmd(t, repoDir, nil, "git", "commit", "-m", "Initial commit")
+	return repoDir
+}
+
+func createFreshSetupTrackedBeadsRepo(t *testing.T, tmpDir, prefix string) string {
+	t.Helper()
+	repoDir := filepath.Join(tmpDir, "tracked-beads-source")
+	if err := os.MkdirAll(filepath.Join(repoDir, ".beads"), 0755); err != nil {
+		t.Fatalf("mkdir tracked beads source: %v", err)
+	}
+
+	runFreshSetupCmd(t, repoDir, nil, "git", "init", "--initial-branch=main")
+	runFreshSetupCmd(t, repoDir, nil, "git", "config", "user.email", "test@test.com")
+	runFreshSetupCmd(t, repoDir, nil, "git", "config", "user.name", "Test User")
+	if err := os.WriteFile(filepath.Join(repoDir, "README.md"), []byte("# Tracked beads fixture\n"), 0644); err != nil {
+		t.Fatalf("write tracked beads README: %v", err)
+	}
+	configYAML := fmt.Sprintf("prefix: %s\nissue-prefix: %s\n", prefix, prefix)
+	if err := os.WriteFile(filepath.Join(repoDir, ".beads", "config.yaml"), []byte(configYAML), 0644); err != nil {
+		t.Fatalf("write tracked beads config: %v", err)
+	}
+	runFreshSetupCmd(t, repoDir, nil, "git", "add", ".")
+	runFreshSetupCmd(t, repoDir, nil, "git", "commit", "-m", "Initial tracked beads fixture")
 	return repoDir
 }
 

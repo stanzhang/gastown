@@ -658,14 +658,22 @@ func (m *Manager) AddRig(opts AddRigOptions) (*Rig, error) {
 	// Only ~/gt/CLAUDE.md (town-root identity anchor) exists on disk.
 	// Full context is injected ephemerally by `gt prime` at session start.
 
-	// Create server-side database for this rig BEFORE initializing beads.
-	// InitBeads runs bd init --server which writes metadata.json, but the actual
-	// database in .dolt-data/ must exist first for bd config commands to work.
+	// Create the server-side database for this rig BEFORE initializing beads.
+	// InitBeads runs bd init --server against this named database; continuing
+	// after provisioning fails lets bd fall back to another database and leaves
+	// a structurally complete rig that cannot receive work.
 	if !opts.SkipDoltCheck {
-		if _, err := exec.LookPath("dolt"); err == nil {
-			if _, _, err := doltserver.InitRig(m.townRoot, opts.Name); err != nil {
-				fmt.Printf("  Warning: Could not create rig database: %v\n", err)
-			}
+		if _, _, err := doltserver.InitRig(m.townRoot, opts.Name); err != nil {
+			return nil, fmt.Errorf("provisioning rig database %q: %w", opts.Name, err)
+		}
+		_, missing, err := doltserver.VerifyExpectedDatabasesAtConfig(
+			doltserver.DefaultConfig(m.townRoot), []string{opts.Name},
+		)
+		if err != nil {
+			return nil, fmt.Errorf("verifying rig database %q: %w", opts.Name, err)
+		}
+		if len(missing) != 0 {
+			return nil, fmt.Errorf("provisioning rig database %q: database is absent from the live server after initialization", opts.Name)
 		}
 	}
 
@@ -871,11 +879,11 @@ Use crew for your own workspace. Polecats are for batch work dispatch.
 	// Seeding at rig-add time would fork the config, silently shadowing
 	// any future repo-side updates.
 
-	// Create rig-level agent beads (witness, refinery) in rig beads.
-	// Town-level agents (mayor, deacon) are created by gt install in town beads.
+	// Create the rig-specific agent beads (witness, refinery). CreateAgentBead
+	// centralizes agent lifecycle records in town beads; the IDs retain the rig
+	// prefix so coordinators can associate them with their owning rig.
 	if err := m.initAgentBeads(rigPath, opts.Name, opts.BeadsPrefix); err != nil {
-		// Non-fatal: log warning but continue
-		fmt.Fprintf(os.Stderr, "  Warning: Could not create agent beads: %v\n", err)
+		return nil, fmt.Errorf("creating rig agent beads: %w", err)
 	}
 
 	// Seed patrol molecules for this rig
@@ -1257,18 +1265,20 @@ func (m *Manager) InitBeads(rigPath, prefix, rigName string) error {
 	return nil
 }
 
-// initAgentBeads creates rig-level agent beads for Witness and Refinery.
-// These agents use the rig's beads prefix and are stored in rig beads.
+// initAgentBeads creates rig-specific agent beads for Witness and Refinery.
+// These agents use the rig's beads prefix and CreateAgentBead stores them in
+// town beads, where town-level coordinators can observe their lifecycle.
 //
 // Town-level agents (Mayor, Deacon) are created by gt install in town beads.
 // Role beads are also created by gt install with hq- prefix.
 //
-// Rig-level agents (Witness, Refinery) are created here in rig beads with rig prefix.
+// Rig-level agents (Witness, Refinery) are created here with the rig prefix.
 // Format: <prefix>-<rig>-<role> (e.g., pi-pixelforge-witness)
 //
 // Agent beads track lifecycle state for ZFC compliance (gt-h3hak, gt-pinkq).
 func (m *Manager) initAgentBeads(rigPath, rigName, prefix string) error {
-	// Rig-level agents go in rig beads with rig prefix (per docs/architecture.md).
+	// Start from the rig beads context so redirect and town-root discovery are
+	// correct; CreateAgentBead selects the centralized town database.
 	// Town-level agents (Mayor, Deacon) are created by gt install in town beads.
 	// Use ResolveBeadsDir to follow redirect files for tracked beads.
 	rigBeadsDir := beads.ResolveBeadsDir(rigPath)
@@ -1282,7 +1292,7 @@ func (m *Manager) initAgentBeads(rigPath, rigName, prefix string) error {
 		desc     string
 	}
 
-	// Create rig-specific agents using rig prefix in rig beads.
+	// Create rig-specific agents using the rig prefix.
 	// Format: <prefix>-<rig>-<role> (e.g., pi-pixelforge-witness)
 	agents := []agentDef{
 		{
