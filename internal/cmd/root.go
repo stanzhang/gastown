@@ -190,12 +190,9 @@ func isRoleCommand(cmd *cobra.Command) bool {
 }
 
 func isDoneCommand(cmd *cobra.Command) bool {
-	for c := cmd; c != nil; c = c.Parent() {
-		if c.Name() == "done" {
-			return true
-		}
-	}
-	return false
+	// Only the top-level `gt done` command uses the polecat completion path.
+	// Nested commands such as `gt dog done` own their completion lifecycle.
+	return cmd == doneCmd
 }
 
 // initCLITheme initializes the CLI color theme based on settings and environment.

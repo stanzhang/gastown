@@ -6,8 +6,6 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-
-	"github.com/spf13/cobra"
 )
 
 func TestResolveDonePolecatWorktreeAcceptsOwnWorktree(t *testing.T) {
@@ -287,13 +285,13 @@ func TestRunDoneRejectsMayorRigBeforeAutosave(t *testing.T) {
 }
 
 func TestIsDoneCommand(t *testing.T) {
-	done := &cobra.Command{Use: "done"}
-	root := &cobra.Command{Use: "gt"}
-	root.AddCommand(done)
-	if !isDoneCommand(done) {
-		t.Fatal("done command should be detected")
+	if !isDoneCommand(doneCmd) {
+		t.Fatal("top-level done command should be detected")
 	}
-	if isDoneCommand(root) {
+	if isDoneCommand(dogDoneCmd) {
+		t.Fatal("dog done command should not be detected as top-level done")
+	}
+	if isDoneCommand(rootCmd) {
 		t.Fatal("root command should not be detected as done")
 	}
 }
@@ -315,8 +313,7 @@ func TestPersistentPreRunDoneRejectsBeforeRegistryFallback(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = os.Chdir(origDir) })
 
-	done := &cobra.Command{Use: "done"}
-	err = persistentPreRun(done, nil)
+	err = persistentPreRun(doneCmd, nil)
 	if err == nil || !strings.Contains(err.Error(), "assigned polecat worktree") {
 		t.Fatalf("persistentPreRun error = %v, want assigned worktree rejection", err)
 	}

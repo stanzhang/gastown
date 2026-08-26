@@ -2,8 +2,11 @@ package cmd
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 
@@ -188,6 +191,74 @@ func splitPath(path string) []string {
 // =============================================================================
 // Dog Done Command Tests
 // =============================================================================
+
+func TestDogDoneCommandAllowsDogActorAndClearsStateAndSession(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("tmux session lifecycle assertion is POSIX-only")
+	}
+	if _, err := exec.LookPath("tmux"); err != nil {
+		t.Skip("tmux not installed")
+	}
+
+	gtBinary := buildGT(t)
+	townRoot := t.TempDir()
+	rigsConfig := &config.RigsConfig{
+		Version: config.CurrentRigsVersion,
+		Rigs: map[string]config.RigEntry{
+			"gastown": {GitURL: "https://example.invalid/gastown.git"},
+		},
+	}
+	if err := config.SaveRigsConfig(filepath.Join(townRoot, "mayor", "rigs.json"), rigsConfig); err != nil {
+		t.Fatalf("SaveRigsConfig: %v", err)
+	}
+
+	mgr := dog.NewManager(townRoot, rigsConfig)
+	now := time.Now()
+	setupTestDog(t, mgr, townRoot, "alpha", &dog.DogState{
+		Name:       "alpha",
+		State:      dog.StateWorking,
+		Work:       "mol-session-gc",
+		LastActive: now,
+		CreatedAt:  now,
+		UpdatedAt:  now,
+	})
+
+	socketName := fmt.Sprintf("gt-test-dog-done-%d-%d", os.Getpid(), time.Now().UnixNano())
+	sessionName := "hq-dog-alpha"
+	startSession := exec.Command("tmux", "-u", "-L", socketName, "new-session", "-d", "-s", sessionName)
+	if output, err := startSession.CombinedOutput(); err != nil {
+		t.Fatalf("start tmux session: %v\n%s", err, output)
+	}
+	t.Cleanup(func() {
+		_ = exec.Command("tmux", "-u", "-L", socketName, "kill-server").Run()
+	})
+
+	done := exec.Command(gtBinary, "dog", "done", "alpha")
+	done.Dir = townRoot
+	done.Env = append(os.Environ(),
+		"BD_ACTOR=dog",
+		"GT_ROLE=dog",
+		"GT_TOWN_ROOT="+townRoot,
+		"GT_ROOT="+townRoot,
+		"GT_TMUX_SOCKET="+socketName,
+		"GT_STALE_WARNED=1",
+	)
+	if output, err := done.CombinedOutput(); err != nil {
+		t.Fatalf("gt dog done alpha: %v\n%s", err, output)
+	}
+
+	d, err := mgr.Get("alpha")
+	if err != nil {
+		t.Fatalf("Get(alpha): %v", err)
+	}
+	if d.State != dog.StateIdle || d.Work != "" {
+		t.Fatalf("dog state after done = state %q work %q, want idle with no work", d.State, d.Work)
+	}
+
+	if err := exec.Command("tmux", "-u", "-L", socketName, "has-session", "-t", "="+sessionName).Run(); err == nil {
+		t.Fatalf("tmux session %s still exists after gt dog done", sessionName)
+	}
+}
 
 // TestDogDone_AlreadyIdle verifies that dogDone handles the case where
 // a dog is already idle gracefully.
