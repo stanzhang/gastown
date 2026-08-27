@@ -203,14 +203,7 @@ func runPrime(cmd *cobra.Command, args []string) (retErr error) {
 			firePolecatHookUnresolvableEscalation(agentID, hookErr.Error())
 			return fmt.Errorf("polecat prime: hook unresolvable: %w", hookErr)
 		}
-		// Database error during hook query — NOT the same as "no work assigned".
-		// Emit a loud warning so the agent does NOT run gt done / close the bead.
-		// This prevents the destructive cycle: DB error → "no work" → gt done → bead lost. (GH#2638)
-		fmt.Fprintf(os.Stderr, "\n%s\n", style.Bold.Render("## ⚠️  DATABASE ERROR — DO NOT RUN gt done ⚠️"))
-		fmt.Fprintf(os.Stderr, "Hook query failed: %v\n", hookErr)
-		fmt.Fprintf(os.Stderr, "This is a database connectivity error, NOT an empty hook.\n")
-		fmt.Fprintf(os.Stderr, "Your work may still be assigned. Do NOT close any beads.\n")
-		fmt.Fprintf(os.Stderr, "Escalate to witness/mayor and wait for resolution.\n\n")
+		return reportPrimeHookQueryFailure(hookErr)
 	}
 	injectWorkContext(ctx, hookedBead)
 
@@ -243,6 +236,19 @@ func runPrime(cmd *cobra.Command, args []string) (retErr error) {
 	}
 
 	return nil
+}
+
+// reportPrimeHookQueryFailure reports a failed hook lookup and stops prime before
+// rendering role directives. Continuing after this warning can render the normal
+// no-work polecat instructions, which contradict the warning and can cause an
+// assigned worker to run gt done while Beads is merely unavailable.
+func reportPrimeHookQueryFailure(hookErr error) error {
+	fmt.Fprintf(os.Stderr, "\n%s\n", style.Bold.Render("## ⚠️  DATABASE ERROR — DO NOT RUN gt done ⚠️"))
+	fmt.Fprintf(os.Stderr, "Hook query failed: %v\n", hookErr)
+	fmt.Fprintf(os.Stderr, "This is a database connectivity error, NOT an empty hook.\n")
+	fmt.Fprintf(os.Stderr, "Your work may still be assigned. Do NOT close any beads.\n")
+	fmt.Fprintf(os.Stderr, "Escalate to witness or mayor; prime stopped before role directives.\n\n")
+	return fmt.Errorf("prime: hook query failed: %w", hookErr)
 }
 
 func ensureRoleWorktreeIntegrity(cwd, townRoot string, role Role) error {

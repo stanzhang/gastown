@@ -47,6 +47,30 @@ func captureStdout(t *testing.T, fn func()) string {
 	return buf.String()
 }
 
+func TestReportPrimeHookQueryFailureStopsBeforeRoleDirectives(t *testing.T) {
+	cause := errors.New("Dolt circuit breaker is open")
+	var gotErr error
+	output := captureStderr(t, func() {
+		gotErr = reportPrimeHookQueryFailure(cause)
+	})
+
+	if !errors.Is(gotErr, cause) {
+		t.Fatalf("reportPrimeHookQueryFailure() error = %v, want wrapped %v", gotErr, cause)
+	}
+	for _, want := range []string{
+		"DATABASE ERROR — DO NOT RUN gt done",
+		"This is a database connectivity error, NOT an empty hook.",
+		"prime stopped before role directives",
+	} {
+		if !strings.Contains(output, want) {
+			t.Errorf("hook-query failure output missing %q:\n%s", want, output)
+		}
+	}
+	if strings.Contains(output, "Just run gt done and exit") {
+		t.Fatalf("hook-query failure output included a conflicting completion directive:\n%s", output)
+	}
+}
+
 func writeTestRoutes(t *testing.T, townRoot string, routes []beads.Route) {
 	t.Helper()
 	beadsDir := filepath.Join(townRoot, ".beads")
