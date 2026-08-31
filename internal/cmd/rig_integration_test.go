@@ -8,6 +8,7 @@ package cmd
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -1007,9 +1008,9 @@ func TestRigAddRejectsInvalidNames(t *testing.T) {
 	}
 }
 
-// TestRigAddCreatesAgentBeads verifies that gt rig add creates
-// witness and refinery agent beads via the manager's initAgentBeads.
-func TestRigAddCreatesAgentBeads(t *testing.T) {
+// TestRigAddCreatesIdentityAndAgentBeads verifies that AddRig creates the rig
+// identity plus witness and refinery agent beads in the rig-local database.
+func TestRigAddCreatesIdentityAndAgentBeads(t *testing.T) {
 	requireDoltServer(t)
 	townRoot := setupTestTown(t)
 	bridgeDoltPidToTown(t, townRoot)
@@ -1034,7 +1035,8 @@ func TestRigAddCreatesAgentBeads(t *testing.T) {
 		t.Fatalf("AddRig: %v", err)
 	}
 
-	// Expected bead IDs that initAgentBeads should create
+	// Expected bead IDs that AddRig should create in the rig-local database.
+	rigID := beads.RigBeadIDWithPrefix(newRig.Config.Prefix, "agentbeadtest")
 	witnessID := beads.WitnessBeadIDWithPrefix(newRig.Config.Prefix, "agentbeadtest")
 	refineryID := beads.RefineryBeadIDWithPrefix(newRig.Config.Prefix, "agentbeadtest")
 
@@ -1042,14 +1044,26 @@ func TestRigAddCreatesAgentBeads(t *testing.T) {
 		id   string
 		desc string
 	}{
+		{rigID, "rig identity bead"},
 		{witnessID, "witness agent bead"},
 		{refineryID, "refinery agent bead"},
 	}
 
-	rigBeads := beads.NewWithBeadsDir(newRig.Path, beads.ResolveBeadsDir(newRig.Path))
+	rigBeads := beads.NewWithBeadsDir(newRig.Path, beads.ResolveBeadsDir(newRig.Path)).Pinned()
 	for _, expected := range expectedIDs {
 		if _, err := rigBeads.Show(expected.id); err != nil {
 			t.Errorf("expected %s (%s) to exist: %v", expected.id, expected.desc, err)
+		}
+	}
+
+	// None of the rig-owned identities should be duplicated in the town DB.
+	townBeadsDir := beads.ResolveBeadsDir(beads.GetTownBeadsPath(townRoot))
+	townBeads := beads.NewWithBeadsDir(townRoot, townBeadsDir).Pinned()
+	for _, expected := range expectedIDs {
+		if _, err := townBeads.Show(expected.id); err == nil {
+			t.Errorf("%s (%s) was also created in the town database", expected.id, expected.desc)
+		} else if !errors.Is(err, beads.ErrNotFound) {
+			t.Errorf("checking town database for %s (%s): %v", expected.id, expected.desc, err)
 		}
 	}
 }

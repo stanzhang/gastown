@@ -557,12 +557,11 @@ type Beads struct {
 	townRoot     string
 	townRootOnce sync.Once
 
-	// noRoute disables prefix-based routing for this Beads instance.
-	// Used for agent-bead operations: agent beads (gt:agent label) live in
-	// the town database regardless of their ID prefix, so prefix routing
-	// (which assumes "za-*" → zack DB) misroutes them. When set, Show()
-	// and forIssueID() skip ResolveRoutingTarget and operate against
-	// beadsDir directly.
+	// noRoute disables prefix-based routing for this Beads instance. It is
+	// used both for legacy town-owned agent lifecycle records and when a caller
+	// has explicitly pinned an authoritative database (for example, rig-local
+	// witness/refinery creation). When set, Show() and forIssueID() operate
+	// against beadsDir directly.
 	noRoute bool
 }
 
@@ -592,15 +591,31 @@ func NewWithBeadsDir(workDir, beadsDir string) *Beads {
 	return &Beads{workDir: workDir, beadsDir: beadsDir}
 }
 
-// ForAgentBead returns a Beads wrapper suitable for operating on agent beads.
+// Pinned returns a Beads wrapper that stays on the database already selected
+// by this wrapper. Prefix-based routing and the agent-bead town override are
+// disabled. Use this only when the caller has already resolved the
+// authoritative database explicitly, such as during rig initialization.
+func (b *Beads) Pinned() *Beads {
+	return &Beads{
+		workDir:    b.workDir,
+		beadsDir:   b.getResolvedBeadsDir(),
+		isolated:   b.isolated,
+		serverPort: b.serverPort,
+		store:      b.store,
+		townRoot:   b.townRoot,
+		noRoute:    true,
+	}
+}
+
+// ForAgentBead returns a Beads wrapper for legacy town-owned agent lifecycle
+// records.
 //
-// Agent beads (labeled gt:agent) live in the TOWN database, but their IDs
-// are prefixed with the rig prefix (e.g. "za-zack-polecat-furiosa"). The
-// default prefix routing in routes.jsonl maps "za-" → zack rig database, so
-// any agent-bead operation issued from a rig context (or any context that
-// triggers routing) gets sent to the wrong DB and fails with "issue not
-// found". This silently breaks gt done's hook clearing, agent state
-// transition, completion metadata, etc.
+// These records are prefixed with the rig prefix (for example,
+// "za-zack-polecat-furiosa") even though their owning database is town. The
+// default prefix route points at the rig database, so lifecycle callers use
+// this helper to retain the established town ownership. Rig initialization is
+// different: witness and refinery identities are rig-owned and must use a
+// Pinned wrapper instead.
 //
 // ForAgentBead bypasses that:
 //   - Re-roots the wrapper at the town's .beads directory (so bd CLI itself

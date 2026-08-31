@@ -11,6 +11,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/doltserver"
 	"github.com/steveyegge/gastown/internal/git"
@@ -935,25 +936,33 @@ func rigEnvMap(env []string) map[string]string {
 	return out
 }
 
-func TestInitAgentBeadsUsesRigBeadsDir(t *testing.T) {
+func TestInitRigBeadsUseRigBeadsDir(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("fake bd stub is not compatible with multiline descriptions on Windows")
 	}
 
-	// Rig-level agent beads (witness, refinery) are stored in rig beads.
+	// Rig identity and rig-level agent beads (witness, refinery) are stored in rig beads.
 	// Town-level agents (mayor, deacon) are created by gt install in town beads.
-	// This test verifies that rig agent beads are created in the rig directory,
+	// This test verifies that all three beads are created in the rig directory,
 	// using the resolved rig beads directory for BEADS_DIR.
 	townRoot := t.TempDir()
 	rigPath := filepath.Join(townRoot, "testrip")
 	rigBeadsDir := filepath.Join(rigPath, ".beads")
+	townBeadsDir := filepath.Join(townRoot, ".beads")
 
-	if err := os.MkdirAll(rigBeadsDir, 0755); err != nil {
-		t.Fatalf("mkdir rig beads dir: %v", err)
+	for _, dir := range []string{filepath.Join(townRoot, "mayor"), townBeadsDir, rigBeadsDir} {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			t.Fatalf("mkdir %s: %v", dir, err)
+		}
 	}
-
-	// Track which agent IDs were created
-	var createdAgents []string
+	if err := os.WriteFile(filepath.Join(townRoot, "mayor", "town.json"), []byte(`{"name":"test"}`), 0644); err != nil {
+		t.Fatalf("write town.json: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(rigBeadsDir, ".gt-types-configured"), []byte(beads.TypeConfigSentinelValue()+"\n"), 0644); err != nil {
+		t.Fatalf("write type sentinel: %v", err)
+	}
+	// Track which deterministic IDs were created.
+	var createdBeads []string
 
 	script := `#!/usr/bin/env bash
 set -e
@@ -1009,6 +1018,9 @@ esac
 	t.Setenv("BEADS_DIR", "") // Clear any existing BEADS_DIR
 
 	manager := &Manager{townRoot: townRoot}
+	if err := manager.initRigIdentityBead(rigPath, "demo", "https://example.com/demo.git", "gt"); err != nil {
+		t.Fatalf("initRigIdentityBead: %v", err)
+	}
 	if err := manager.initAgentBeads(rigPath, "demo", "gt"); err != nil {
 		t.Fatalf("initAgentBeads: %v", err)
 	}
@@ -1018,23 +1030,23 @@ esac
 	if err != nil {
 		t.Fatalf("reading agent log: %v", err)
 	}
-	createdAgents = strings.Split(strings.TrimSpace(string(data)), "\n")
+	createdBeads = strings.Split(strings.TrimSpace(string(data)), "\n")
 
-	// Should create witness and refinery for the rig
-	expectedAgents := map[string]bool{
+	expectedBeads := map[string]bool{
+		"gt-rig-demo":      false,
 		"gt-demo-witness":  false,
 		"gt-demo-refinery": false,
 	}
 
-	for _, id := range createdAgents {
-		if _, ok := expectedAgents[id]; ok {
-			expectedAgents[id] = true
+	for _, id := range createdBeads {
+		if _, ok := expectedBeads[id]; ok {
+			expectedBeads[id] = true
 		}
 	}
 
-	for id, found := range expectedAgents {
+	for id, found := range expectedBeads {
 		if !found {
-			t.Errorf("expected agent %s was not created", id)
+			t.Errorf("expected bead %s was not created", id)
 		}
 	}
 	assertBeadsDirLog(t, beadsDirLog, rigBeadsDir)

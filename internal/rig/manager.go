@@ -841,9 +841,8 @@ Use crew for your own workspace. Polecats are for batch work dispatch.
 		fmt.Printf("  %s Could not scaffold polecat commands: %v\n", "!", err)
 	}
 
-	// Register route in town-level routes.jsonl BEFORE creating agent beads.
-	// initAgentBeads calls ResolveRoutingTarget which needs the route to exist.
-	// Without this, agent bead creation logs "no route found" warnings (#1424).
+	// Register route in town-level routes.jsonl before creating rig identity and
+	// agent beads so normal post-initialization lookups resolve to this rig.
 	if opts.BeadsPrefix != "" {
 		routePath := opts.Name
 		mayorRigBeads := filepath.Join(rigPath, "mayor", "rig", ".beads")
@@ -870,6 +869,14 @@ Use crew for your own workspace. Polecats are for batch work dispatch.
 	// by loadRigCommandVars (repo defaults → local overrides → --var flags).
 	// Seeding at rig-add time would fork the config, silently shadowing
 	// any future repo-side updates.
+
+	// Create the rig identity bead in the rig database. Keeping this inside
+	// AddRig ensures the freshly initialized, explicitly pinned database is used
+	// and avoids a second CLI-level creation pass with stale routing context.
+	if err := m.initRigIdentityBead(rigPath, opts.Name, opts.GitURL, opts.BeadsPrefix); err != nil {
+		// Non-fatal: the rig remains usable and gt doctor can repair the bead.
+		fmt.Fprintf(os.Stderr, "  Warning: Could not create rig identity bead: %v\n", err)
+	}
 
 	// Create rig-level agent beads (witness, refinery) in rig beads.
 	// Town-level agents (mayor, deacon) are created by gt install in town beads.
@@ -1270,9 +1277,10 @@ func (m *Manager) InitBeads(rigPath, prefix, rigName string) error {
 func (m *Manager) initAgentBeads(rigPath, rigName, prefix string) error {
 	// Rig-level agents go in rig beads with rig prefix (per docs/architecture.md).
 	// Town-level agents (Mayor, Deacon) are created by gt install in town beads.
-	// Use ResolveBeadsDir to follow redirect files for tracked beads.
+	// Resolve redirects once, then pin the wrapper so CreateAgentBead does not
+	// apply the legacy town-level agent override.
 	rigBeadsDir := beads.ResolveBeadsDir(rigPath)
-	bd := beads.NewWithBeadsDir(rigPath, rigBeadsDir)
+	bd := beads.NewWithBeadsDir(rigPath, rigBeadsDir).Pinned()
 
 	// Define rig-level agents to create
 	type agentDef struct {
@@ -1321,6 +1329,23 @@ func (m *Manager) initAgentBeads(rigPath, rigName, prefix string) error {
 		fmt.Printf("   ✓ Created agent bead: %s\n", agent.id)
 	}
 
+	return nil
+}
+
+// initRigIdentityBead creates the rig's durable identity in the rig-local
+// database selected during AddRig.
+func (m *Manager) initRigIdentityBead(rigPath, rigName, repo, prefix string) error {
+	rigBeadsDir := beads.ResolveBeadsDir(rigPath)
+	bd := beads.NewWithBeadsDir(rigPath, rigBeadsDir).Pinned()
+	fields := &beads.RigFields{
+		Repo:   repo,
+		Prefix: prefix,
+		State:  beads.RigStateActive,
+	}
+	if _, err := bd.CreateRigBead(rigName, fields); err != nil {
+		return err
+	}
+	fmt.Printf("   ✓ Created rig identity bead: %s\n", beads.RigBeadIDWithPrefix(prefix, rigName))
 	return nil
 }
 
